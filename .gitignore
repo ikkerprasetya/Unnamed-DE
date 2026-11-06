@@ -1,0 +1,5 @@
+# does not push executables
+dist/*
+# does not push executables named main in the root folder
+main
+
