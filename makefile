@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -std=c17
 LDLIBS = -lX11
 
 TARGET = dist/main
-SRC = src/main.c
+SRC = src/wm.c
 
 all: $(TARGET)
 
@@ -14,4 +14,3 @@ clean:
 	rm -f $(TARGET)
 
 .PHONY: all clean
-
