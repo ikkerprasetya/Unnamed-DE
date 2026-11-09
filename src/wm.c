@@ -3,9 +3,11 @@
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -42,7 +44,7 @@ static int screen_number;
 static int screen_width;
 static int screen_height;
 static int body_height;
-static int running = 1;
+static volatile sig_atomic_t running = 1;
 static Window panel;
 static Window desktop;
 static Window notice;
@@ -70,6 +72,10 @@ static int subtract(int a, int b) {
 
 static int ignore_error(Display *d, XErrorEvent *e) {
     return 0;
+}
+
+static void on_signal(int signal_number) {
+    running = 0;
 }
 
 static void spawn(const char *path) {
@@ -220,6 +226,9 @@ static void focus_client(int i, int raise) {
     }
     if (raise) {
         XRaiseWindow(display, clients[i].frame);
+        if (notice != 0) {
+            XRaiseWindow(display, notice);
+        }
     }
     XSetInputFocus(display, clients[i].client, RevertToPointerRoot, CurrentTime);
     active = i;
@@ -323,6 +332,15 @@ static void frame_client(Window w) {
     clients[i].y = PANEL_HEIGHT + 20 + offset;
     clients[i].width = width;
     clients[i].height = height + TITLE_HEIGHT;
+    if (clients[i].x + clients[i].width > screen_width) {
+        clients[i].x = subtract(screen_width, clients[i].width);
+    }
+    if (clients[i].y + clients[i].height > screen_height) {
+        clients[i].y = subtract(screen_height, clients[i].height);
+    }
+    if (clients[i].y < PANEL_HEIGHT) {
+        clients[i].y = PANEL_HEIGHT;
+    }
     clients[i].frame = XCreateSimpleWindow(display, root, clients[i].x, clients[i].y,
                                            clients[i].width, clients[i].height, 1,
                                            BlackPixel(display, screen_number),
@@ -482,7 +500,7 @@ static void on_key(XKeyEvent key) {
         spawn("./files");
     } else if (symbol == XK_s) {
         spawn("./settings");
-    } else if (symbol == XK_q) {
+    } else if (symbol == XK_q || symbol == XK_F4) {
         close_client(active);
     } else if (symbol == XK_Tab) {
         cycle();
@@ -598,7 +616,8 @@ static void on_client_message(XClientMessageEvent message) {
 }
 
 static void bind_keys(void) {
-    KeySym symbols[10] = {XK_Return, XK_f, XK_s, XK_q, XK_Tab, XK_e, XK_1, XK_2, XK_3, XK_4};
+    KeySym symbols[11] = {XK_Return, XK_f, XK_s, XK_q, XK_Tab, XK_e,
+                          XK_1, XK_2, XK_3, XK_4, XK_F4};
     unsigned int variants[4] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     unsigned int shifts[2] = {0, ShiftMask};
     unsigned int buttons[2] = {Button1, Button3};
@@ -606,7 +625,7 @@ static void bind_keys(void) {
     int j;
     int k;
 
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < 11; i++) {
         KeyCode code = XKeysymToKeycode(display, symbols[i]);
         for (j = 0; j < 4; j++) {
             for (k = 0; k < 2; k++) {
@@ -626,13 +645,19 @@ static void bind_keys(void) {
 
 int main(void) {
     XEvent event;
+    fd_set fds;
+    struct timeval interval;
     char pid[32];
+    int connection;
     int i;
 
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
     display = XOpenDisplay(NULL);
     if (display == NULL) {
         return 1;
     }
+    connection = ConnectionNumber(display);
     screen_number = DefaultScreen(display);
     root = RootWindow(display, screen_number);
     screen_width = DisplayWidth(display, screen_number);
@@ -665,6 +690,14 @@ int main(void) {
     spawn("./notify");
 
     while (running) {
+        if (XPending(display) == 0) {
+            FD_ZERO(&fds);
+            FD_SET(connection, &fds);
+            interval.tv_sec = 1;
+            interval.tv_usec = 0;
+            select(connection + 1, &fds, NULL, NULL, &interval);
+            continue;
+        }
         XNextEvent(display, &event);
         switch (event.type) {
         case MapRequest:
