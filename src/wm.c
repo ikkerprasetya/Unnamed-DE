@@ -144,7 +144,7 @@ static int find_by_frame(Window w) {
     int i;
     for (i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].used && clients[i].frame == w) {
-            return i;
+            return i;   
         }
     }
     return MAX_CLIENTS;
