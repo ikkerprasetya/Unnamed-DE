@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c17
+CFLAGS = -Wall -Wextra -std=c17 -D_POSIX_C_SOURCE=200112L
 LDLIBS = -lX11
 
 TARGET = dist/main
