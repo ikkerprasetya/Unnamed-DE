@@ -3,6 +3,7 @@
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 #define MIN_WIDTH 120
 #define MIN_HEIGHT 60
 #define MARGIN 12
+#define KEY_COUNT 11
 
 enum { KIND_NORMAL, KIND_PANEL, KIND_DESKTOP, KIND_NOTIFY };
 enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE };
@@ -44,6 +46,7 @@ static int screen_number;
 static int screen_width;
 static int screen_height;
 static int body_height;
+static int other_wm = 0;
 static volatile sig_atomic_t running = 1;
 static Window panel;
 static Window desktop;
@@ -56,6 +59,7 @@ static int drag_x;
 static int drag_y;
 static int drag_width;
 static int drag_height;
+static Atom atom_supported;
 static Atom atom_client_list;
 static Atom atom_active_window;
 static Atom atom_current_desktop;
@@ -71,10 +75,21 @@ static int subtract(int a, int b) {
 }
 
 static int ignore_error(Display *d, XErrorEvent *e) {
+    (void)d;
+    (void)e;
+    return 0;
+}
+
+static int startup_error(Display *d, XErrorEvent *e) {
+    (void)d;
+    if ((*e).error_code == BadAccess) {
+        other_wm = 1;
+    }
     return 0;
 }
 
 static void on_signal(int signal_number) {
+    (void)signal_number;
     running = 0;
 }
 
@@ -84,6 +99,7 @@ static void spawn(const char *path) {
         if (fork() == 0) {
             setsid();
             execl(path, path, (char *)NULL);
+            _exit(1);
         }
         _exit(0);
     }
@@ -103,7 +119,9 @@ static void get_title(Window w, char *buffer, int size) {
     buffer[0] = '\0';
     if (XGetWindowProperty(display, w, atom_name, 0, 128, False, atom_utf8,
                            &type, &format, &count, &after, &data) == Success && data != NULL) {
-        snprintf(buffer, size, "%s", (char *)data);
+        if (type == atom_utf8 && format == 8) {
+            snprintf(buffer, size, "%s", (char *)data);
+        }
         XFree(data);
     }
     if (buffer[0] != '\0') {
@@ -144,7 +162,7 @@ static int find_by_frame(Window w) {
     int i;
     for (i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].used && clients[i].frame == w) {
-            return i;   
+            return i;
         }
     }
     return MAX_CLIENTS;
@@ -306,7 +324,9 @@ static void frame_client(Window w) {
         XMapWindow(display, w);
         return;
     }
-    XGetWindowAttributes(display, w, &attributes);
+    if (!XGetWindowAttributes(display, w, &attributes)) {
+        return;
+    }
     width = attributes.width;
     height = attributes.height;
     max_height = subtract(screen_height, PANEL_HEIGHT + TITLE_HEIGHT);
@@ -401,7 +421,9 @@ static void on_map_request(Window w) {
     }
     if (kind == KIND_NOTIFY) {
         notice = w;
-        XGetWindowAttributes(display, w, &attributes);
+        if (!XGetWindowAttributes(display, w, &attributes)) {
+            return;
+        }
         XMoveWindow(display, w, subtract(screen_width, attributes.width + MARGIN),
                     PANEL_HEIGHT + MARGIN);
         XMapWindow(display, w);
@@ -414,13 +436,23 @@ static void on_map_request(Window w) {
 static void on_configure_request(XConfigureRequestEvent request) {
     XWindowChanges changes;
     int i = find_by_client(request.window);
+    int width;
+    int height;
 
     if (i != MAX_CLIENTS) {
         if (request.value_mask & CWWidth) {
-            clients[i].width = request.width;
+            width = request.width;
+            if (width < MIN_WIDTH) {
+                width = MIN_WIDTH;
+            }
+            clients[i].width = width;
         }
         if (request.value_mask & CWHeight) {
-            clients[i].height = request.height + TITLE_HEIGHT;
+            height = request.height;
+            if (height < MIN_HEIGHT) {
+                height = MIN_HEIGHT;
+            }
+            clients[i].height = height + TITLE_HEIGHT;
         }
         XResizeWindow(display, clients[i].frame, clients[i].width, clients[i].height);
         XResizeWindow(display, clients[i].client, clients[i].width,
@@ -504,7 +536,7 @@ static void on_key(XKeyEvent key) {
         close_client(active);
     } else if (symbol == XK_Tab) {
         cycle();
-    } else if (symbol == XK_e) {
+    } else if (symbol == XK_e && shift) {
         running = 0;
     } else if (symbol >= XK_1 && symbol < XK_1 + WORKSPACES) {
         number = subtract((int)symbol, (int)XK_1);
@@ -616,8 +648,8 @@ static void on_client_message(XClientMessageEvent message) {
 }
 
 static void bind_keys(void) {
-    KeySym symbols[11] = {XK_Return, XK_f, XK_s, XK_q, XK_Tab, XK_e,
-                          XK_1, XK_2, XK_3, XK_4, XK_F4};
+    KeySym symbols[KEY_COUNT] = {XK_Return, XK_f, XK_s, XK_q, XK_Tab, XK_e,
+                                 XK_1, XK_2, XK_3, XK_4, XK_F4};
     unsigned int variants[4] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     unsigned int shifts[2] = {0, ShiftMask};
     unsigned int buttons[2] = {Button1, Button3};
@@ -625,7 +657,7 @@ static void bind_keys(void) {
     int j;
     int k;
 
-    for (i = 0; i < 11; i++) {
+    for (i = 0; i < KEY_COUNT; i++) {
         KeyCode code = XKeysymToKeycode(display, symbols[i]);
         for (j = 0; j < 4; j++) {
             for (k = 0; k < 2; k++) {
@@ -647,6 +679,7 @@ int main(void) {
     XEvent event;
     fd_set fds;
     struct timeval interval;
+    Atom supported[5];
     char pid[32];
     int connection;
     int i;
@@ -658,13 +691,24 @@ int main(void) {
         return 1;
     }
     connection = ConnectionNumber(display);
+    fcntl(connection, F_SETFD, FD_CLOEXEC);
     screen_number = DefaultScreen(display);
     root = RootWindow(display, screen_number);
     screen_width = DisplayWidth(display, screen_number);
     screen_height = DisplayHeight(display, screen_number);
     body_height = subtract(screen_height, PANEL_HEIGHT);
 
+    XSetErrorHandler(startup_error);
+    XSelectInput(display, root, SubstructureRedirectMask | SubstructureNotifyMask);
+    XSync(display, False);
+    if (other_wm) {
+        fprintf(stderr, "another window manager is already running\n");
+        XCloseDisplay(display);
+        return 1;
+    }
     XSetErrorHandler(ignore_error);
+
+    atom_supported = XInternAtom(display, "_NET_SUPPORTED", False);
     atom_client_list = XInternAtom(display, "_NET_CLIENT_LIST", False);
     atom_active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
     atom_current_desktop = XInternAtom(display, "_NET_CURRENT_DESKTOP", False);
@@ -675,11 +719,17 @@ int main(void) {
     atom_protocols = XInternAtom(display, "WM_PROTOCOLS", False);
     atom_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
 
+    supported[0] = atom_client_list;
+    supported[1] = atom_active_window;
+    supported[2] = atom_current_desktop;
+    supported[3] = atom_number_of_desktops;
+    supported[4] = atom_close_window;
+    XChangeProperty(display, root, atom_supported, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char *)supported, 5);
+
     gc = XCreateGC(display, root, 0, NULL);
     XSetForeground(display, gc, BlackPixel(display, screen_number));
     XDefineCursor(display, root, XCreateFontCursor(display, XC_left_ptr));
-    XSelectInput(display, root, SubstructureRedirectMask | SubstructureNotifyMask);
-    XSync(display, False);
     bind_keys();
     publish();
 
@@ -725,6 +775,8 @@ int main(void) {
             }
             break;
         case MotionNotify:
+            while (XCheckTypedEvent(display, MotionNotify, &event)) {
+            }
             on_motion(event.xmotion);
             break;
         case Expose:
@@ -742,7 +794,8 @@ int main(void) {
             break;
         case PropertyNotify:
             i = find_by_client(event.xproperty.window);
-            if (i != MAX_CLIENTS) {
+            if (i != MAX_CLIENTS &&
+                (event.xproperty.atom == atom_name || event.xproperty.atom == XA_WM_NAME)) {
                 draw_frame(i);
             }
             break;
