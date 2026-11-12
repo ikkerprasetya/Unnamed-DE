@@ -5,11 +5,13 @@
 #define LABEL_CHARS 12
 #define ROWS_PER_COLUMN 10
 #define REFRESH_SECONDS 3
+#define REFILL_DELAY_MS 150
 
 static GtkWidget *picture;
 static GtkWidget *flow;
 static GFileMonitor *monitor;
 static gchar *loaded_path;
+static guint refill_source;
 
 static gint compare_names(gconstpointer a, gconstpointer b) {
     return g_utf8_collate((const gchar *)a, (const gchar *)b);
@@ -27,7 +29,7 @@ static gboolean refresh_wallpaper(gpointer data) {
     (void)data;
     if (g_file_get_contents(file, &contents, NULL, NULL)) {
         g_strstrip(contents);
-        if (g_strcmp0(contents, loaded_path) != 0 && contents[0] != '\0' &&
+        if (contents[0] != '\0' && g_strcmp0(contents, loaded_path) != 0 &&
             g_file_test(contents, G_FILE_TEST_IS_REGULAR)) {
             g_free(loaded_path);
             loaded_path = g_strdup(contents);
@@ -44,14 +46,13 @@ static void open_entry(GtkButton *button, gpointer data) {
 
     (void)button;
     if (!g_app_info_launch_default_for_uri((const char *)data, NULL, &error)) {
-        g_warning("cannot open %s: %s", (const char *)data, (*error).message);
-        g_error_free(error);
+        g_warning("cannot open %s: %s", (const char *)data,
+                  error != NULL ? (*error).message : "unknown error");
+        g_clear_error(&error);
     }
 }
 
-static void add_entry(gpointer item, gpointer user_data) {
-    const gchar *name = (const gchar *)item;
-    const gchar *directory = (const gchar *)user_data;
+static GtkWidget *build_entry(const gchar *directory, const gchar *name) {
     gchar *path = g_build_filename(directory, name, NULL);
     GFile *file = g_file_new_for_path(path);
     GFileInfo *info = g_file_query_info(file,
@@ -60,42 +61,45 @@ static void add_entry(gpointer item, gpointer user_data) {
                                         G_FILE_QUERY_INFO_NONE, NULL, NULL);
     GtkWidget *button = gtk_button_new();
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, BOX_SPACING);
-    GtkWidget *image;
     GtkWidget *label;
-    GIcon *icon;
     const gchar *text = name;
 
     if (info != NULL) {
-        icon = g_file_info_get_icon(info);
+        GIcon *icon = g_file_info_get_icon(info);
+        const gchar *display = g_file_info_get_display_name(info);
+
         if (icon != NULL) {
-            image = gtk_image_new_from_gicon(icon);
+            GtkWidget *image = gtk_image_new_from_gicon(icon);
+
             gtk_image_set_pixel_size(GTK_IMAGE(image), ICON_SIZE);
             gtk_box_append(GTK_BOX(box), image);
         }
-        if (g_file_info_get_display_name(info) != NULL) {
-            text = g_file_info_get_display_name(info);
+        if (display != NULL) {
+            text = display;
         }
     }
     label = gtk_label_new(text);
     gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
     gtk_label_set_max_width_chars(GTK_LABEL(label), LABEL_CHARS);
+    gtk_widget_set_tooltip_text(label, text);
     gtk_box_append(GTK_BOX(box), label);
     gtk_button_set_child(GTK_BUTTON(button), box);
     g_signal_connect_data(button, "clicked", G_CALLBACK(open_entry), g_file_get_uri(file),
                           free_uri, 0);
-    gtk_flow_box_append(GTK_FLOW_BOX(flow), button);
 
     if (info != NULL) {
         g_object_unref(info);
     }
     g_object_unref(file);
     g_free(path);
+    return button;
 }
 
 static void fill_icons(void) {
     const gchar *directory = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
     GtkWidget *child;
     GList *names = NULL;
+    GList *item;
     GDir *dir;
     const gchar *name;
 
@@ -111,12 +115,28 @@ static void fill_icons(void) {
     }
     while ((name = g_dir_read_name(dir)) != NULL) {
         if (name[0] != '.') {
-            names = g_list_insert_sorted(names, g_strdup(name), compare_names);
+            names = g_list_prepend(names, g_strdup(name));
         }
     }
     g_dir_close(dir);
-    g_list_foreach(names, add_entry, (gpointer)directory);
+    names = g_list_sort(names, compare_names);
+    for (item = names; item != NULL; item = (*item).next) {
+        gtk_flow_box_append(GTK_FLOW_BOX(flow), build_entry(directory, (const gchar *)(*item).data));
+    }
     g_list_free_full(names, g_free);
+}
+
+static gboolean run_refill(gpointer data) {
+    (void)data;
+    refill_source = 0;
+    fill_icons();
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_refill(void) {
+    if (refill_source == 0) {
+        refill_source = g_timeout_add(REFILL_DELAY_MS, run_refill, NULL);
+    }
 }
 
 static void on_directory_changed(GFileMonitor *source, GFile *file, GFile *other,
@@ -125,8 +145,16 @@ static void on_directory_changed(GFileMonitor *source, GFile *file, GFile *other
     (void)file;
     (void)other;
     (void)data;
-    if (event != G_FILE_MONITOR_EVENT_CHANGED) {
-        fill_icons();
+    switch (event) {
+    case G_FILE_MONITOR_EVENT_CREATED:
+    case G_FILE_MONITOR_EVENT_DELETED:
+    case G_FILE_MONITOR_EVENT_RENAMED:
+    case G_FILE_MONITOR_EVENT_MOVED_IN:
+    case G_FILE_MONITOR_EVENT_MOVED_OUT:
+        schedule_refill();
+        break;
+    default:
+        break;
     }
 }
 
@@ -138,7 +166,7 @@ static void watch_directory(void) {
         return;
     }
     file = g_file_new_for_path(directory);
-    monitor = g_file_monitor_directory(file, G_FILE_MONITOR_NONE, NULL, NULL);
+    monitor = g_file_monitor_directory(file, G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);
     g_object_unref(file);
     if (monitor != NULL) {
         g_signal_connect(monitor, "changed", G_CALLBACK(on_directory_changed), NULL);
@@ -184,6 +212,8 @@ int main(int argc, char **argv) {
 
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_clear_object(&monitor);
+    g_free(loaded_path);
     g_object_unref(app);
     return status;
 }
