@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PANEL_HEIGHT 32
@@ -20,7 +21,11 @@
 #define MIN_WIDTH 120
 #define MIN_HEIGHT 60
 #define MARGIN 12
-#define KEY_COUNT 11
+#define KEY_COUNT 12
+#define ANIMATION_MS 170
+#define FRAME_MS 16
+#define OPEN_SLIDE 24
+#define DOUBLE_CLICK_MS 300
 
 enum { KIND_NORMAL, KIND_PANEL, KIND_DESKTOP, KIND_NOTIFY };
 enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE };
@@ -34,6 +39,21 @@ typedef struct {
     int y;
     int width;
     int height;
+    int ax;
+    int ay;
+    int awidth;
+    int aheight;
+    int animating;
+    long start;
+    int from_x;
+    int from_y;
+    int from_width;
+    int from_height;
+    int maximized;
+    int saved_x;
+    int saved_y;
+    int saved_width;
+    int saved_height;
 } Client;
 
 static Display *display;
@@ -51,6 +71,8 @@ static volatile sig_atomic_t running = 1;
 static Window panel;
 static Window desktop;
 static Window notice;
+static Window check;
+static int desktop_focused = 0;
 static int drag_mode = DRAG_NONE;
 static int drag_index;
 static int drag_pointer_x;
@@ -59,12 +81,18 @@ static int drag_x;
 static int drag_y;
 static int drag_width;
 static int drag_height;
+static int last_click_index = MAX_CLIENTS;
+static Time last_click_time = 0;
+static long last_tick = 0;
 static Atom atom_supported;
 static Atom atom_client_list;
 static Atom atom_active_window;
 static Atom atom_current_desktop;
 static Atom atom_number_of_desktops;
 static Atom atom_close_window;
+static Atom atom_workarea;
+static Atom atom_extents;
+static Atom atom_check;
 static Atom atom_name;
 static Atom atom_utf8;
 static Atom atom_protocols;
@@ -72,6 +100,17 @@ static Atom atom_delete;
 
 static int subtract(int a, int b) {
     return a + (~b + 1);
+}
+
+static long subtract_long(long a, long b) {
+    return a + (~b + 1);
+}
+
+static long now_ms(void) {
+    struct timespec spec;
+
+    clock_gettime(CLOCK_MONOTONIC, &spec);
+    return (long)spec.tv_sec * 1000 + spec.tv_nsec / 1000000;
 }
 
 static int ignore_error(Display *d, XErrorEvent *e) {
@@ -178,6 +217,36 @@ static int first_in_workspace(void) {
     return MAX_CLIENTS;
 }
 
+static void publish_static(void) {
+    unsigned long area[4 * WORKSPACES];
+    unsigned long check_value;
+    int i;
+
+    for (i = 0; i < WORKSPACES; i++) {
+        area[i * 4] = 0;
+        area[i * 4 + 1] = PANEL_HEIGHT;
+        area[i * 4 + 2] = (unsigned long)screen_width;
+        area[i * 4 + 3] = (unsigned long)body_height;
+    }
+    XChangeProperty(display, root, atom_workarea, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char *)area, 4 * WORKSPACES);
+    check = XCreateSimpleWindow(display, root, 0, 0, 1, 1, 0, 0, 0);
+    check_value = check;
+    XChangeProperty(display, root, atom_check, XA_WINDOW, 32, PropModeReplace,
+                    (unsigned char *)&check_value, 1);
+    XChangeProperty(display, check, atom_check, XA_WINDOW, 32, PropModeReplace,
+                    (unsigned char *)&check_value, 1);
+    XChangeProperty(display, check, atom_name, atom_utf8, 8, PropModeReplace,
+                    (unsigned char *)"bare_de", 7);
+}
+
+static void set_extents(Window w) {
+    unsigned long extents[4] = {1, 1, TITLE_HEIGHT + 1, 1};
+
+    XChangeProperty(display, w, atom_extents, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char *)extents, 4);
+}
+
 static void publish(void) {
     unsigned long list[MAX_CLIENTS];
     unsigned long count = 0;
@@ -208,13 +277,13 @@ static void publish(void) {
 
 static void draw_frame(int i) {
     char title[256];
-    int button_x = subtract(clients[i].width, BUTTON_WIDTH) + 8;
+    int button_x = subtract(clients[i].awidth, BUTTON_WIDTH) + 8;
 
     get_title(clients[i].client, title, sizeof(title));
     XClearWindow(display, clients[i].frame);
     XDrawString(display, clients[i].frame, gc, 6, 14, title, (int)strlen(title));
     XDrawString(display, clients[i].frame, gc, button_x, 14, "x", 1);
-    XDrawLine(display, clients[i].frame, gc, 0, TITLE_HEIGHT, clients[i].width, TITLE_HEIGHT);
+    XDrawLine(display, clients[i].frame, gc, 0, TITLE_HEIGHT, clients[i].awidth, TITLE_HEIGHT);
 }
 
 static void send_configure(int i) {
@@ -225,19 +294,136 @@ static void send_configure(int i) {
     configure.display = display;
     configure.event = clients[i].client;
     configure.window = clients[i].client;
-    configure.x = clients[i].x + 1;
-    configure.y = clients[i].y + TITLE_HEIGHT + 1;
-    configure.width = clients[i].width;
-    configure.height = subtract(clients[i].height, TITLE_HEIGHT);
+    configure.x = clients[i].ax + 1;
+    configure.y = clients[i].ay + TITLE_HEIGHT + 1;
+    configure.width = clients[i].awidth;
+    configure.height = subtract(clients[i].aheight, TITLE_HEIGHT);
     configure.border_width = 0;
     configure.above = None;
     configure.override_redirect = False;
     XSendEvent(display, clients[i].client, False, StructureNotifyMask, (XEvent *)&configure);
 }
 
+static void place(int i, int x, int y, int width, int height) {
+    int resized = width != clients[i].awidth || height != clients[i].aheight;
+
+    clients[i].ax = x;
+    clients[i].ay = y;
+    clients[i].awidth = width;
+    clients[i].aheight = height;
+    if (resized) {
+        XMoveResizeWindow(display, clients[i].frame, x, y, width, height);
+        XResizeWindow(display, clients[i].client, width, subtract(height, TITLE_HEIGHT));
+    } else {
+        XMoveWindow(display, clients[i].frame, x, y);
+    }
+    send_configure(i);
+    if (resized) {
+        draw_frame(i);
+    }
+}
+
+static void set_geometry(int i, int x, int y, int width, int height) {
+    clients[i].animating = 0;
+    clients[i].x = x;
+    clients[i].y = y;
+    clients[i].width = width;
+    clients[i].height = height;
+    place(i, x, y, width, height);
+}
+
+static void animate_to(int i, int x, int y, int width, int height) {
+    clients[i].from_x = clients[i].ax;
+    clients[i].from_y = clients[i].ay;
+    clients[i].from_width = clients[i].awidth;
+    clients[i].from_height = clients[i].aheight;
+    clients[i].x = x;
+    clients[i].y = y;
+    clients[i].width = width;
+    clients[i].height = height;
+    clients[i].start = now_ms();
+    clients[i].animating = 1;
+}
+
+static void settle(int i) {
+    if (clients[i].animating) {
+        clients[i].animating = 0;
+        place(i, clients[i].x, clients[i].y, clients[i].width, clients[i].height);
+    }
+}
+
+static int lerp(int from, int to, int eased) {
+    return from + subtract(to, from) * eased / 1000;
+}
+
+static int any_animating(void) {
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].used && clients[i].animating) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void tick_animations(void) {
+    long now;
+    int i;
+    int elapsed;
+    int progress;
+    int inverse;
+    int eased;
+
+    if (!any_animating()) {
+        return;
+    }
+    now = now_ms();
+    if (now < last_tick + FRAME_MS) {
+        return;
+    }
+    last_tick = now;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].used || !clients[i].animating) {
+            continue;
+        }
+        elapsed = (int)subtract_long(now, clients[i].start);
+        if (elapsed >= ANIMATION_MS) {
+            settle(i);
+            continue;
+        }
+        progress = elapsed * 1000 / ANIMATION_MS;
+        inverse = subtract(1000, progress);
+        eased = subtract(1000, inverse * inverse * inverse / 1000000);
+        place(i, lerp(clients[i].from_x, clients[i].x, eased),
+              lerp(clients[i].from_y, clients[i].y, eased),
+              lerp(clients[i].from_width, clients[i].width, eased),
+              lerp(clients[i].from_height, clients[i].height, eased));
+    }
+    XFlush(display);
+}
+
+static void toggle_maximize(int i) {
+    if (i == MAX_CLIENTS) {
+        return;
+    }
+    if (clients[i].maximized) {
+        clients[i].maximized = 0;
+        animate_to(i, clients[i].saved_x, clients[i].saved_y,
+                   clients[i].saved_width, clients[i].saved_height);
+        return;
+    }
+    clients[i].saved_x = clients[i].x;
+    clients[i].saved_y = clients[i].y;
+    clients[i].saved_width = clients[i].width;
+    clients[i].saved_height = clients[i].height;
+    clients[i].maximized = 1;
+    animate_to(i, 0, PANEL_HEIGHT, subtract(screen_width, 2), subtract(body_height, 2));
+}
+
 static void focus_client(int i, int raise) {
     if (i == MAX_CLIENTS) {
         active = MAX_CLIENTS;
+        desktop_focused = 0;
         XSetInputFocus(display, root, RevertToPointerRoot, CurrentTime);
         publish();
         return;
@@ -248,8 +434,19 @@ static void focus_client(int i, int raise) {
             XRaiseWindow(display, notice);
         }
     }
+    desktop_focused = 0;
     XSetInputFocus(display, clients[i].client, RevertToPointerRoot, CurrentTime);
     active = i;
+    publish();
+}
+
+static void focus_desktop(void) {
+    if (desktop == 0 || desktop_focused) {
+        return;
+    }
+    desktop_focused = 1;
+    active = MAX_CLIENTS;
+    XSetInputFocus(display, desktop, RevertToPointerRoot, CurrentTime);
     publish();
 }
 
@@ -345,6 +542,7 @@ static void frame_client(Window w) {
     offset = (cascade % 8) * 24;
     cascade++;
 
+    memset(&clients[i], 0, sizeof(clients[i]));
     clients[i].used = 1;
     clients[i].client = w;
     clients[i].workspace = current;
@@ -361,8 +559,12 @@ static void frame_client(Window w) {
     if (clients[i].y < PANEL_HEIGHT) {
         clients[i].y = PANEL_HEIGHT;
     }
-    clients[i].frame = XCreateSimpleWindow(display, root, clients[i].x, clients[i].y,
-                                           clients[i].width, clients[i].height, 1,
+    clients[i].ax = clients[i].x;
+    clients[i].ay = clients[i].y + OPEN_SLIDE;
+    clients[i].awidth = clients[i].width;
+    clients[i].aheight = clients[i].height;
+    clients[i].frame = XCreateSimpleWindow(display, root, clients[i].ax, clients[i].ay,
+                                           clients[i].awidth, clients[i].aheight, 1,
                                            BlackPixel(display, screen_number),
                                            WhitePixel(display, screen_number));
     XSelectInput(display, clients[i].frame,
@@ -370,21 +572,27 @@ static void frame_client(Window w) {
                  ExposureMask | EnterWindowMask);
     XSelectInput(display, w, PropertyChangeMask);
     XAddToSaveSet(display, w);
+    set_extents(w);
     XResizeWindow(display, w, width, height);
     XReparentWindow(display, w, clients[i].frame, 0, TITLE_HEIGHT);
     XMapWindow(display, w);
     XMapWindow(display, clients[i].frame);
     send_configure(i);
     focus_client(i, 1);
+    animate_to(i, clients[i].x, clients[i].y, clients[i].width, clients[i].height);
 }
 
 static void remove_client(int i, int alive) {
     if (alive) {
-        XReparentWindow(display, clients[i].client, root, clients[i].x, clients[i].y);
+        XReparentWindow(display, clients[i].client, root, clients[i].ax, clients[i].ay);
         XRemoveFromSaveSet(display, clients[i].client);
     }
     XDestroyWindow(display, clients[i].frame);
     clients[i].used = 0;
+    clients[i].animating = 0;
+    if (last_click_index == i) {
+        last_click_index = MAX_CLIENTS;
+    }
     if (drag_mode != DRAG_NONE && drag_index == i) {
         drag_mode = DRAG_NONE;
         XUngrabPointer(display, CurrentTime);
@@ -414,6 +622,7 @@ static void on_map_request(Window w) {
     }
     if (kind == KIND_DESKTOP) {
         desktop = w;
+        XSelectInput(display, w, EnterWindowMask);
         XMoveResizeWindow(display, w, 0, PANEL_HEIGHT, screen_width, body_height);
         XMapWindow(display, w);
         XLowerWindow(display, w);
@@ -440,25 +649,24 @@ static void on_configure_request(XConfigureRequestEvent request) {
     int height;
 
     if (i != MAX_CLIENTS) {
+        width = clients[i].width;
+        height = clients[i].height;
         if (request.value_mask & CWWidth) {
             width = request.width;
             if (width < MIN_WIDTH) {
                 width = MIN_WIDTH;
             }
-            clients[i].width = width;
+            clients[i].maximized = 0;
         }
         if (request.value_mask & CWHeight) {
             height = request.height;
             if (height < MIN_HEIGHT) {
                 height = MIN_HEIGHT;
             }
-            clients[i].height = height + TITLE_HEIGHT;
+            height = height + TITLE_HEIGHT;
+            clients[i].maximized = 0;
         }
-        XResizeWindow(display, clients[i].frame, clients[i].width, clients[i].height);
-        XResizeWindow(display, clients[i].client, clients[i].width,
-                      subtract(clients[i].height, TITLE_HEIGHT));
-        send_configure(i);
-        draw_frame(i);
+        set_geometry(i, clients[i].x, clients[i].y, width, height);
         return;
     }
     if (request.window == panel || request.window == desktop) {
@@ -494,6 +702,7 @@ static void on_destroy(Window w) {
     }
     if (w == desktop) {
         desktop = 0;
+        desktop_focused = 0;
     }
     if (w == notice) {
         notice = 0;
@@ -532,6 +741,8 @@ static void on_key(XKeyEvent key) {
         spawn("./files");
     } else if (symbol == XK_s) {
         spawn("./settings");
+    } else if (symbol == XK_m) {
+        toggle_maximize(active);
     } else if (symbol == XK_q || symbol == XK_F4) {
         close_client(active);
     } else if (symbol == XK_Tab) {
@@ -553,6 +764,7 @@ static void on_key(XKeyEvent key) {
 }
 
 static void start_drag(int i, int mode, XButtonEvent press) {
+    settle(i);
     drag_mode = mode;
     drag_index = i;
     drag_pointer_x = press.x_root;
@@ -579,9 +791,14 @@ static void on_button_press(XButtonEvent press) {
     } else if (alt && press.button == Button3) {
         start_drag(i, DRAG_RESIZE, press);
     } else if (!alt && press.button == Button1 && press.y < TITLE_HEIGHT) {
-        if (press.x >= subtract(clients[i].width, BUTTON_WIDTH)) {
+        if (press.x >= subtract(clients[i].awidth, BUTTON_WIDTH)) {
             close_client(i);
+        } else if (last_click_index == i && press.time <= last_click_time + DOUBLE_CLICK_MS) {
+            last_click_index = MAX_CLIENTS;
+            toggle_maximize(i);
         } else {
+            last_click_index = i;
+            last_click_time = press.time;
             start_drag(i, DRAG_MOVE, press);
         }
     }
@@ -590,8 +807,6 @@ static void on_button_press(XButtonEvent press) {
 static void on_motion(XMotionEvent motion) {
     int dx;
     int dy;
-    int x;
-    int y;
     int width;
     int height;
 
@@ -600,16 +815,17 @@ static void on_motion(XMotionEvent motion) {
     }
     dx = subtract(motion.x_root, drag_pointer_x);
     dy = subtract(motion.y_root, drag_pointer_y);
+    if (dx != 0 || dy != 0) {
+        clients[drag_index].maximized = 0;
+    }
     if (drag_mode == DRAG_MOVE) {
-        x = drag_x + dx;
-        y = drag_y + dy;
+        int x = drag_x + dx;
+        int y = drag_y + dy;
+
         if (y < PANEL_HEIGHT) {
             y = PANEL_HEIGHT;
         }
-        clients[drag_index].x = x;
-        clients[drag_index].y = y;
-        XMoveWindow(display, clients[drag_index].frame, x, y);
-        send_configure(drag_index);
+        set_geometry(drag_index, x, y, clients[drag_index].width, clients[drag_index].height);
         return;
     }
     width = drag_width + dx;
@@ -620,12 +836,7 @@ static void on_motion(XMotionEvent motion) {
     if (height < MIN_HEIGHT + TITLE_HEIGHT) {
         height = MIN_HEIGHT + TITLE_HEIGHT;
     }
-    clients[drag_index].width = width;
-    clients[drag_index].height = height;
-    XResizeWindow(display, clients[drag_index].frame, width, height);
-    XResizeWindow(display, clients[drag_index].client, width, subtract(height, TITLE_HEIGHT));
-    send_configure(drag_index);
-    draw_frame(drag_index);
+    set_geometry(drag_index, clients[drag_index].x, clients[drag_index].y, width, height);
 }
 
 static void on_client_message(XClientMessageEvent message) {
@@ -649,7 +860,7 @@ static void on_client_message(XClientMessageEvent message) {
 
 static void bind_keys(void) {
     KeySym symbols[KEY_COUNT] = {XK_Return, XK_f, XK_s, XK_q, XK_Tab, XK_e,
-                                 XK_1, XK_2, XK_3, XK_4, XK_F4};
+                                 XK_1, XK_2, XK_3, XK_4, XK_F4, XK_m};
     unsigned int variants[4] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
     unsigned int shifts[2] = {0, ShiftMask};
     unsigned int buttons[2] = {Button1, Button3};
@@ -679,7 +890,7 @@ int main(void) {
     XEvent event;
     fd_set fds;
     struct timeval interval;
-    Atom supported[5];
+    Atom supported[8];
     char pid[32];
     int connection;
     int i;
@@ -714,6 +925,9 @@ int main(void) {
     atom_current_desktop = XInternAtom(display, "_NET_CURRENT_DESKTOP", False);
     atom_number_of_desktops = XInternAtom(display, "_NET_NUMBER_OF_DESKTOPS", False);
     atom_close_window = XInternAtom(display, "_NET_CLOSE_WINDOW", False);
+    atom_workarea = XInternAtom(display, "_NET_WORKAREA", False);
+    atom_extents = XInternAtom(display, "_NET_FRAME_EXTENTS", False);
+    atom_check = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
     atom_name = XInternAtom(display, "_NET_WM_NAME", False);
     atom_utf8 = XInternAtom(display, "UTF8_STRING", False);
     atom_protocols = XInternAtom(display, "WM_PROTOCOLS", False);
@@ -724,13 +938,17 @@ int main(void) {
     supported[2] = atom_current_desktop;
     supported[3] = atom_number_of_desktops;
     supported[4] = atom_close_window;
+    supported[5] = atom_workarea;
+    supported[6] = atom_extents;
+    supported[7] = atom_check;
     XChangeProperty(display, root, atom_supported, XA_ATOM, 32, PropModeReplace,
-                    (unsigned char *)supported, 5);
+                    (unsigned char *)supported, 8);
 
     gc = XCreateGC(display, root, 0, NULL);
     XSetForeground(display, gc, BlackPixel(display, screen_number));
     XDefineCursor(display, root, XCreateFontCursor(display, XC_left_ptr));
     bind_keys();
+    publish_static();
     publish();
 
     snprintf(pid, sizeof(pid), "%d", (int)getpid());
@@ -740,11 +958,12 @@ int main(void) {
     spawn("./notify");
 
     while (running) {
+        tick_animations();
         if (XPending(display) == 0) {
             FD_ZERO(&fds);
             FD_SET(connection, &fds);
-            interval.tv_sec = 1;
-            interval.tv_usec = 0;
+            interval.tv_sec = any_animating() ? 0 : 1;
+            interval.tv_usec = any_animating() ? FRAME_MS * 1000 : 0;
             select(connection + 1, &fds, NULL, NULL, &interval);
             continue;
         }
@@ -786,10 +1005,13 @@ int main(void) {
             }
             break;
         case EnterNotify:
-            i = find_by_frame(event.xcrossing.window);
-            if (i != MAX_CLIENTS && event.xcrossing.mode == NotifyNormal &&
-                drag_mode == DRAG_NONE && i != active) {
-                focus_client(i, 0);
+            if (event.xcrossing.mode == NotifyNormal && drag_mode == DRAG_NONE) {
+                i = find_by_frame(event.xcrossing.window);
+                if (i != MAX_CLIENTS && i != active) {
+                    focus_client(i, 0);
+                } else if (i == MAX_CLIENTS && event.xcrossing.window == desktop) {
+                    focus_desktop();
+                }
             }
             break;
         case PropertyNotify:
