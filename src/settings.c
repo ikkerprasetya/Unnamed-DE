@@ -12,9 +12,10 @@
 #define REFRESH_DELAY 2
 #define BATTERY_SECONDS 5
 #define POWER_DIRECTORY "/sys/class/power_supply"
+#define DASH 45
 
 static GtkWidget *window;
-static GtkWidget *network_label;
+static GtkWidget *network_list;
 static GtkWidget *battery_label;
 static GtkWidget *status_label;
 static GtkWidget *mute_button;
@@ -196,16 +197,120 @@ static void on_brightness_changed(GtkRange *range, gpointer data) {
     brightness_timer = g_timeout_add(APPLY_DELAY, apply_brightness, NULL);
 }
 
+static int subtract(int a, int b) {
+    return a + (~b + 1);
+}
+
+static int find_column(const gchar *header, const gchar *name) {
+    size_t length = strlen(name);
+    char previous = ' ';
+    int i;
+
+    for (i = 0; header[i] != '\0'; i++) {
+        if (previous == ' ' && strncmp(header + i, name, length) == 0) {
+            return i;
+        }
+        previous = header[i];
+    }
+    return G_MAXINT;
+}
+
+static gchar *column(const gchar *line, int start, int end) {
+    int length = (int)strlen(line);
+    gchar *text;
+
+    if (start >= length) {
+        return g_strdup("");
+    }
+    if (end > length) {
+        end = length;
+    }
+    if (end <= start) {
+        return g_strdup("");
+    }
+    text = g_strndup(line + start, (gsize)subtract(end, start));
+    return g_strstrip(text);
+}
+
+static void add_row(const gchar *text, const gchar *ssid) {
+    GtkWidget *label = gtk_label_new(text);
+
+    gtk_label_set_xalign(GTK_LABEL(label), 0);
+    if (ssid != NULL) {
+        g_object_set_data_full(G_OBJECT(label), "ssid", g_strdup(ssid), g_free);
+    }
+    gtk_list_box_append(GTK_LIST_BOX(network_list), label);
+}
+
 static void on_refresh_done(GObject *source, GAsyncResult *result, gpointer data) {
     gboolean success;
     gchar *text = collect(source, result, &success);
+    gchar **lines = g_strsplit(text, "\n", 0);
+    GtkWidget *child;
+    int ssid_start = G_MAXINT;
+    int mode_start = G_MAXINT;
+    int signal_start = G_MAXINT;
+    int bars_start = G_MAXINT;
+    int security_start = G_MAXINT;
+    int count = 0;
+    int i;
 
-    if (text[0] == '\0') {
-        gtk_label_set_text(GTK_LABEL(network_label), "No networks found");
-    } else {
-        gtk_label_set_text(GTK_LABEL(network_label), text);
+    while ((child = gtk_widget_get_first_child(network_list)) != NULL) {
+        gtk_list_box_remove(GTK_LIST_BOX(network_list), child);
     }
+    if (success && lines[0] != NULL) {
+        ssid_start = find_column(lines[0], "SSID");
+        mode_start = find_column(lines[0], "MODE");
+        signal_start = find_column(lines[0], "SIGNAL");
+        bars_start = find_column(lines[0], "BARS");
+        security_start = find_column(lines[0], "SECURITY");
+        for (i = 1; lines[i] != NULL; i++) {
+            gchar *ssid = column(lines[i], ssid_start, mode_start);
+            gchar *strength = column(lines[i], signal_start, bars_start);
+            gchar *security = column(lines[i], security_start, G_MAXINT);
+            gchar *row;
+
+            if (ssid[0] != '\0' && !(ssid[0] == DASH && ssid[1] == DASH)) {
+                row = g_strdup_printf("%s%s  %s%%  %s", lines[i][0] == '*' ? "* " : "  ",
+                                      ssid, strength, security);
+                add_row(row, ssid);
+                g_free(row);
+                count++;
+            }
+            g_free(ssid);
+            g_free(strength);
+            g_free(security);
+        }
+    }
+    if (count == 0) {
+        if (!success && text[0] != '\0') {
+            add_row(text, NULL);
+        } else {
+            add_row("No networks found", NULL);
+        }
+    }
+    g_strfreev(lines);
     g_free(text);
+}
+
+static void on_row_activated(GtkListBox *list, GtkListBoxRow *row, gpointer data) {
+    GtkWidget *child = gtk_list_box_row_get_child(row);
+    const gchar *ssid = g_object_get_data(G_OBJECT(child), "ssid");
+
+    if (ssid == NULL) {
+        return;
+    }
+    gtk_editable_set_text(GTK_EDITABLE(ssid_entry), ssid);
+    gtk_widget_grab_focus(password_entry);
+}
+
+static gboolean on_key(GtkEventControllerKey *controller, guint keyval, guint keycode,
+                       GdkModifierType state, gpointer data) {
+    if (keyval == GDK_KEY_Escape) {
+        gtk_window_destroy(GTK_WINDOW(window));
+        return GDK_EVENT_STOP;
+    }
+    return GDK_EVENT_PROPAGATE;
 }
 
 static void refresh_network(void) {
@@ -397,6 +502,10 @@ static void activate(GtkApplication *app, gpointer data) {
     GtkWidget *wifi_off = gtk_button_new_with_label("Wifi Off");
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
     GtkWidget *wallpaper_button = gtk_button_new_with_label("Choose Wallpaper");
+    GtkWidget *volume_label = gtk_label_new("Volume");
+    GtkWidget *brightness_label = gtk_label_new("Brightness");
+    GtkSizeGroup *group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+    GtkEventController *keys = gtk_event_controller_key_new();
     char output[OUTPUT_SIZE];
 
     window = gtk_application_window_new(app);
@@ -412,7 +521,7 @@ static void activate(GtkApplication *app, gpointer data) {
     connect_button = gtk_button_new_with_label("Connect");
     ssid_entry = gtk_entry_new();
     password_entry = gtk_password_entry_new();
-    network_label = gtk_label_new("");
+    network_list = gtk_list_box_new();
     battery_label = gtk_label_new("");
     status_label = gtk_label_new("");
 
@@ -420,19 +529,21 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(password_entry), TRUE);
     gtk_widget_set_hexpand(ssid_entry, TRUE);
     gtk_widget_set_hexpand(password_entry, TRUE);
-    gtk_label_set_xalign(GTK_LABEL(network_label), 0);
-    gtk_label_set_selectable(GTK_LABEL(network_label), TRUE);
     gtk_label_set_xalign(GTK_LABEL(battery_label), 0);
     gtk_label_set_xalign(GTK_LABEL(status_label), 0);
     gtk_label_set_wrap(GTK_LABEL(status_label), TRUE);
     gtk_widget_set_vexpand(scroll, TRUE);
     gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 160);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), network_label);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), network_list);
 
-    gtk_box_append(GTK_BOX(volume_row), gtk_label_new("Volume"));
+    gtk_label_set_xalign(GTK_LABEL(volume_label), 0);
+    gtk_label_set_xalign(GTK_LABEL(brightness_label), 0);
+    gtk_size_group_add_widget(group, volume_label);
+    gtk_size_group_add_widget(group, brightness_label);
+    gtk_box_append(GTK_BOX(volume_row), volume_label);
     gtk_box_append(GTK_BOX(volume_row), make_scale(get_volume(), G_CALLBACK(on_volume_changed)));
     gtk_box_append(GTK_BOX(volume_row), mute_button);
-    gtk_box_append(GTK_BOX(brightness_row), gtk_label_new("Brightness"));
+    gtk_box_append(GTK_BOX(brightness_row), brightness_label);
     gtk_box_append(GTK_BOX(brightness_row),
                    make_scale(get_brightness(), G_CALLBACK(on_brightness_changed)));
     gtk_box_append(GTK_BOX(wifi_row), wifi_on);
@@ -448,6 +559,10 @@ static void activate(GtkApplication *app, gpointer data) {
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_clicked), NULL);
     g_signal_connect(connect_button, "clicked", G_CALLBACK(on_connect), NULL);
     g_signal_connect(password_entry, "activate", G_CALLBACK(on_enter), NULL);
+    g_signal_connect(network_list, "row_activated", G_CALLBACK(on_row_activated), NULL);
+    g_signal_connect(keys, "key_pressed", G_CALLBACK(on_key), NULL);
+    gtk_widget_add_controller(window, keys);
+    g_object_unref(group);
     g_signal_connect(wallpaper_button, "clicked", G_CALLBACK(on_wallpaper_clicked), NULL);
 
     gtk_box_append(GTK_BOX(box), make_title("Sound"));
