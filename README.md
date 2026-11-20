@@ -1,4 +1,3 @@
 # Unnamed-DE
-Nothing here
-
-should be smth
+A DE that combines both Light-weight and Customization together.
+**UNDER DEVELOPMENT**
