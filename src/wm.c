@@ -32,6 +32,11 @@
  *   MOD+Wheel         previous / next workspace
  *   MOD+Left drag     move (tiled window becomes floating)
  *   MOD+Right drag    resize (tiled window becomes floating)
+ *
+ * Helper programs (terminal, files, settings, desktop, panel, notify) are
+ * looked up in the directory of this executable, not in the current directory.
+ * Dialogs, splash screens and utility windows open floating on their own.
+ * Windows that already exist when the manager starts are adopted.
  */
 
 #define MOD Mod4Mask
@@ -131,6 +136,7 @@ static int ws_ratio[WORKSPACES];
 static int ws_colw[WORKSPACES];
 static int ws_scroll[WORKSPACES];
 static int ws_last[WORKSPACES];
+static char base_dir[512];
 static Atom atom_supported;
 static Atom atom_client_list;
 static Atom atom_active_window;
@@ -145,6 +151,10 @@ static Atom atom_protocols;
 static Atom atom_delete;
 static Atom atom_state;
 static Atom atom_fullscreen;
+static Atom atom_type;
+static Atom atom_type_dialog;
+static Atom atom_type_splash;
+static Atom atom_type_utility;
 
 static int subtract(int a, int b) {
     return a + (~b + 1);
@@ -184,11 +194,34 @@ static void on_signal(int signal_number) {
     running = 0;
 }
 
-static void spawn(const char *path) {
+/* Remembers the directory this executable lives in, so helpers are found from anywhere. */
+static void init_base_dir(void) {
+    ssize_t length = readlink("/proc/self/exe", base_dir, sizeof(base_dir) / 2);
+    char *slash;
+
+    if (length <= 0) {
+        snprintf(base_dir, sizeof(base_dir), ".");
+        return;
+    }
+    base_dir[length] = '\0';
+    slash = strrchr(base_dir, '/');
+    if (slash == NULL) {
+        snprintf(base_dir, sizeof(base_dir), ".");
+    } else if (slash == base_dir) {
+        base_dir[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+}
+
+static void spawn(const char *name) {
     pid_t pid = fork();
     if (pid == 0) {
         if (fork() == 0) {
+            char path[640];
+
             setsid();
+            snprintf(path, sizeof(path), "%s/%s", base_dir, name);
             execl(path, path, (char *)NULL);
             _exit(1);
         }
@@ -247,6 +280,34 @@ static int kind_of(Window w) {
         return KIND_NOTIFY;
     }
     return KIND_NORMAL;
+}
+
+/* Dialogs, splash screens and utility windows should not be tiled. */
+static int wants_float(Window w) {
+    Atom type;
+    int format;
+    unsigned long count;
+    unsigned long after;
+    unsigned long k;
+    unsigned char *data = NULL;
+    Atom *types;
+    int result = 0;
+
+    if (XGetWindowProperty(display, w, atom_type, 0, 8, False, XA_ATOM,
+                           &type, &format, &count, &after, &data) != Success || data == NULL) {
+        return 0;
+    }
+    if (type == XA_ATOM && format == 32) {
+        types = (Atom *)data;
+        for (k = 0; k < count; k++) {
+            if (types[k] == atom_type_dialog || types[k] == atom_type_splash ||
+                types[k] == atom_type_utility) {
+                result = 1;
+            }
+        }
+    }
+    XFree(data);
+    return result;
 }
 
 static int find_by_client(Window w) {
@@ -687,7 +748,11 @@ static void arrange(void) {
     }
 }
 
-static void focus_client(int i, int raise) {
+/*
+ * scroll is 0 when focus comes from the mouse hovering a window: in the scrolling
+ * layout the strip then stays put instead of jumping under the pointer.
+ */
+static void focus_client(int i, int raise, int scroll) {
     if (i == MAX_CLIENTS) {
         active = MAX_CLIENTS;
         desktop_focused = 0;
@@ -705,7 +770,7 @@ static void focus_client(int i, int raise) {
     XSetInputFocus(display, clients[i].window, RevertToPointerRoot, CurrentTime);
     update_borders();
     publish();
-    if (ws_layout[current] == LAYOUT_SCROLL && clients[i].workspace == current) {
+    if (scroll && ws_layout[current] == LAYOUT_SCROLL && clients[i].workspace == current) {
         arrange();
     }
 }
@@ -749,7 +814,7 @@ static void switch_workspace(int n) {
         }
     }
     arrange();
-    focus_client(pick_focus(), 1);
+    focus_client(pick_focus(), 1, 1);
     restack();
 }
 
@@ -763,7 +828,7 @@ static void send_to_workspace(int i, int n) {
         active = MAX_CLIENTS;
     }
     arrange();
-    focus_client(pick_focus(), 1);
+    focus_client(pick_focus(), 1, 1);
 }
 
 static void close_client(int i) {
@@ -870,7 +935,7 @@ static void focus_dir(int dir) {
         j = neighbor(active, dir);
     }
     if (j != MAX_CLIENTS) {
-        focus_client(j, 1);
+        focus_client(j, 1, 1);
         warp_to(j);
     }
 }
@@ -1016,7 +1081,7 @@ static void cycle(void) {
     for (step = 1; step <= MAX_CLIENTS; step++) {
         i = (start + step) % MAX_CLIENTS;
         if (clients[i].used && clients[i].workspace == current && i != active) {
-            focus_client(i, 1);
+            focus_client(i, 1, 1);
             warp_to(i);
             return;
         }
@@ -1088,6 +1153,9 @@ static void manage_window(Window w) {
     if (XGetTransientForHint(display, w, &transient)) {
         clients[i].floating = 1;
     }
+    if (wants_float(w)) {
+        clients[i].floating = 1;
+    }
     if (XGetWMNormalHints(display, w, &hints, &supplied) &&
         (hints.flags & PMinSize) && (hints.flags & PMaxSize) &&
         hints.min_width == hints.max_width && hints.min_height == hints.max_height) {
@@ -1114,7 +1182,7 @@ static void manage_window(Window w) {
     }
     set_visible(i, 1);
     restack();
-    focus_client(i, 1);
+    focus_client(i, 1, 1);
 }
 
 static void remove_client(int i) {
@@ -1134,7 +1202,7 @@ static void remove_client(int i) {
     }
     if (active == i) {
         active = MAX_CLIENTS;
-        focus_client(pick_focus(), 1);
+        focus_client(pick_focus(), 1, 1);
     } else {
         publish();
     }
@@ -1182,6 +1250,32 @@ static void on_map_request(Window w) {
         return;
     }
     manage_window(w);
+}
+
+/* Takes over windows that were already mapped before this manager started. */
+static void adopt_existing(void) {
+    Window parent;
+    Window root_return;
+    Window *children = NULL;
+    unsigned int count = 0;
+    unsigned int k;
+    XWindowAttributes attributes;
+
+    if (!XQueryTree(display, root, &root_return, &parent, &children, &count)) {
+        return;
+    }
+    for (k = 0; k < count; k++) {
+        if (children[k] == check) {
+            continue;
+        }
+        if (XGetWindowAttributes(display, children[k], &attributes) &&
+            !attributes.override_redirect && attributes.map_state == IsViewable) {
+            on_map_request(children[k]);
+        }
+    }
+    if (children != NULL) {
+        XFree(children);
+    }
 }
 
 static void on_configure_request(XConfigureRequestEvent request) {
@@ -1234,7 +1328,7 @@ static void on_unmap(Window w) {
         return;
     }
     if (clients[i].ignore_unmap > 0) {
-        clients[i].ignore_unmap--;
+        clients[i].ignore_unmap = subtract(clients[i].ignore_unmap, 1);
         return;
     }
     remove_client(i);
@@ -1292,15 +1386,15 @@ static void on_key(XKeyEvent key) {
             focus_dir(dir);
         }
     } else if (symbol == XK_Return) {
-        spawn("./terminal");
+        spawn("terminal");
     } else if (symbol == XK_e) {
         if (shift) {
             running = 0;
         } else {
-            spawn("./files");
+            spawn("files");
         }
     } else if (symbol == XK_s) {
-        spawn("./settings");
+        spawn("settings");
     } else if (symbol == XK_q) {
         close_client(active);
     } else if (symbol == XK_Tab) {
@@ -1368,7 +1462,7 @@ static void on_button_press(XButtonEvent press) {
     if (i == MAX_CLIENTS) {
         return;
     }
-    focus_client(i, 1);
+    focus_client(i, 1, 1);
     if (clients[i].fullscreen) {
         return;
     }
@@ -1424,7 +1518,7 @@ static void on_client_message(XClientMessageEvent message) {
         if (clients[i].workspace != current) {
             switch_workspace(clients[i].workspace);
         }
-        focus_client(i, 1);
+        focus_client(i, 1, 1);
     } else if (message.message_type == atom_current_desktop) {
         switch_workspace((int)message.data.l[0]);
     } else if (message.message_type == atom_close_window) {
@@ -1500,6 +1594,7 @@ int main(void) {
     screen_width = DisplayWidth(display, screen_number);
     screen_height = DisplayHeight(display, screen_number);
     body_height = subtract(screen_height, PANEL_HEIGHT);
+    init_base_dir();
 
     XSetErrorHandler(startup_error);
     XSelectInput(display, root, SubstructureRedirectMask | SubstructureNotifyMask);
@@ -1525,6 +1620,10 @@ int main(void) {
     atom_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
     atom_state = XInternAtom(display, "_NET_WM_STATE", False);
     atom_fullscreen = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
+    atom_type = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
+    atom_type_dialog = XInternAtom(display, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    atom_type_splash = XInternAtom(display, "_NET_WM_WINDOW_TYPE_SPLASH", False);
+    atom_type_utility = XInternAtom(display, "_NET_WM_WINDOW_TYPE_UTILITY", False);
 
     supported[0] = atom_client_list;
     supported[1] = atom_active_window;
@@ -1552,12 +1651,13 @@ int main(void) {
     bind_keys();
     publish_static();
     publish();
+    adopt_existing();
 
     snprintf(pid, sizeof(pid), "%d", (int)getpid());
     setenv("DE_SESSION_PID", pid, 1);
-    spawn("./desktop");
-    spawn("./panel");
-    spawn("./notify");
+    spawn("desktop");
+    spawn("panel");
+    spawn("notify");
 
     while (running) {
         tick_animations();
@@ -1606,7 +1706,7 @@ int main(void) {
                 !any_animating()) {
                 i = find_by_client(event.xcrossing.window);
                 if (i != MAX_CLIENTS && i != active && clients[i].mapped) {
-                    focus_client(i, 0);
+                    focus_client(i, 0, 0);
                 } else if (i == MAX_CLIENTS && event.xcrossing.window == desktop) {
                     focus_desktop();
                 }
