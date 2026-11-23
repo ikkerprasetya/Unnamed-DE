@@ -24,6 +24,7 @@
 static GtkWidget *picture;
 static GtkWidget *flow;
 static GFileMonitor *monitor;
+static GHashTable *known;
 static gchar *loaded_path;
 static guint refill_source;
 static gint icon_size = ICON_SIZE;
@@ -109,9 +110,9 @@ static void reveal_entry(gpointer data) {
     g_object_unref(button);
 }
 
-static GtkWidget *build_entry(const gchar *directory, const gchar *name, guint index) {
-    gchar *path = g_build_filename(directory, name, NULL);
-    GFile *file = g_file_new_for_path(path);
+static GtkWidget *build_entry(const gchar *directory, const gchar *name,
+                              gboolean fresh, guint order) {
+    GFile *file = g_file_new_build_filename(directory, name, NULL);
     GFileInfo *info = g_file_query_info(file,
                                         G_FILE_ATTRIBUTE_STANDARD_ICON ","
                                         G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME,
@@ -120,7 +121,6 @@ static GtkWidget *build_entry(const gchar *directory, const gchar *name, guint i
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, BOX_SPACING);
     GtkWidget *label;
     const gchar *text = name;
-    guint delay = MIN(STAGGER_BASE_MS + index * STAGGER_STEP_MS, STAGGER_MAX_MS);
 
     if (info != NULL) {
         GIcon *icon = g_file_info_get_icon(info);
@@ -143,16 +143,20 @@ static GtkWidget *build_entry(const gchar *directory, const gchar *name, guint i
     gtk_box_append(GTK_BOX(box), label);
     gtk_button_set_child(GTK_BUTTON(button), box);
     gtk_widget_add_css_class(button, "entry");
-    gtk_widget_add_css_class(button, "fresh");
     g_signal_connect_data(button, "clicked", G_CALLBACK(open_entry), g_file_get_uri(file),
                           free_uri, 0);
-    g_timeout_add_once(delay, reveal_entry, g_object_ref(button));
+
+    if (fresh) {
+        guint delay = MIN(STAGGER_BASE_MS + order * STAGGER_STEP_MS, STAGGER_MAX_MS);
+
+        gtk_widget_add_css_class(button, "fresh");
+        g_timeout_add_once(delay, reveal_entry, g_object_ref(button));
+    }
 
     if (info != NULL) {
         g_object_unref(info);
     }
     g_object_unref(file);
-    g_free(path);
     return button;
 }
 
@@ -175,36 +179,39 @@ static void apply_icon_size(void) {
 
 static void fill_icons(void) {
     const gchar *directory = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
-    GtkWidget *child;
+    GHashTable *current = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     GList *names = NULL;
     GList *item;
-    GDir *dir;
+    GDir *dir = NULL;
     const gchar *name;
-    guint index = 0;
+    guint order = 0;
 
-    while ((child = gtk_widget_get_first_child(flow)) != NULL) {
-        gtk_flow_box_remove(GTK_FLOW_BOX(flow), child);
+    gtk_flow_box_remove_all(GTK_FLOW_BOX(flow));
+    if (directory != NULL) {
+        dir = g_dir_open(directory, 0, NULL);
     }
-    if (directory == NULL) {
-        return;
-    }
-    dir = g_dir_open(directory, 0, NULL);
-    if (dir == NULL) {
-        return;
-    }
-    while ((name = g_dir_read_name(dir)) != NULL) {
-        if (name[0] != '.') {
-            names = g_list_prepend(names, g_strdup(name));
+    if (dir != NULL) {
+        while ((name = g_dir_read_name(dir)) != NULL) {
+            if (name[0] != '.') {
+                names = g_list_prepend(names, g_strdup(name));
+            }
         }
+        g_dir_close(dir);
     }
-    g_dir_close(dir);
     names = g_list_sort(names, compare_names);
     for (item = names; item != NULL; item = (*item).next) {
-        gtk_flow_box_append(GTK_FLOW_BOX(flow),
-                            build_entry(directory, (const gchar *)(*item).data, index));
-        index++;
+        const gchar *entry = (const gchar *)(*item).data;
+        gboolean fresh = !g_hash_table_contains(known, entry);
+
+        g_hash_table_add(current, g_strdup(entry));
+        gtk_flow_box_append(GTK_FLOW_BOX(flow), build_entry(directory, entry, fresh, order));
+        if (fresh) {
+            order++;
+        }
     }
     g_list_free_full(names, g_free);
+    g_hash_table_unref(known);
+    known = current;
 }
 
 static gboolean run_refill(gpointer data) {
@@ -319,6 +326,7 @@ static GtkWidget *build_dock(void) {
 }
 
 static GtkWidget *build_icons(void) {
+    known = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     flow = gtk_flow_box_new();
     gtk_orientable_set_orientation(GTK_ORIENTABLE(flow), GTK_ORIENTATION_VERTICAL);
     gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(flow), GTK_SELECTION_NONE);
@@ -361,6 +369,7 @@ int main(int argc, char **argv) {
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     status = g_application_run(G_APPLICATION(app), argc, argv);
     g_clear_object(&monitor);
+    g_clear_pointer(&known, g_hash_table_unref);
     g_free(loaded_path);
     g_object_unref(app);
     return status;
