@@ -27,7 +27,12 @@ static GFileMonitor *monitor;
 static GHashTable *known;
 static gchar *loaded_path;
 static guint refill_source;
+static guint swap_source;
 static gint icon_size = ICON_SIZE;
+
+static const gchar *desktop_directory(void) {
+    return g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
+}
 
 static gint compare_names(gconstpointer a, gconstpointer b) {
     return g_utf8_collate((const gchar *)a, (const gchar *)b);
@@ -43,8 +48,8 @@ static gint label_chars(void) {
 }
 
 static void load_css(void) {
-    GtkCssProvider *provider = gtk_css_provider_new();
-    gchar *css = g_strdup_printf(
+    g_autoptr(GtkCssProvider) provider = gtk_css_provider_new();
+    g_autofree gchar *css = g_strdup_printf(
         "button.entry { transition: opacity %dms ease, transform %dms ease; }"
         "button.entry.fresh { opacity: 0; transform: scale(0.85); }"
         "button.entry:hover { transform: scale(1.08); }"
@@ -56,50 +61,60 @@ static void load_css(void) {
     gtk_style_context_add_provider_for_display(gdk_display_get_default(),
                                                GTK_STYLE_PROVIDER(provider),
                                                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_free(css);
-    g_object_unref(provider);
 }
 
-static void swap_wallpaper(gpointer data) {
+static gchar *read_wallpaper_path(void) {
+    g_autofree gchar *file = g_build_filename(g_get_user_config_dir(), "de", "wallpaper", NULL);
+    gchar *contents = NULL;
+
+    if (!g_file_get_contents(file, &contents, NULL, NULL)) {
+        return NULL;
+    }
+    g_strstrip(contents);
+    if (contents[0] == '\0' || !g_file_test(contents, G_FILE_TEST_IS_REGULAR)) {
+        g_free(contents);
+        return NULL;
+    }
+    return contents;
+}
+
+static gboolean swap_wallpaper(gpointer data) {
     (void)data;
+    swap_source = 0;
     gtk_picture_set_filename(GTK_PICTURE(picture), loaded_path);
     gtk_widget_remove_css_class(picture, "dim");
+    return G_SOURCE_REMOVE;
 }
 
 static gboolean refresh_wallpaper(gpointer data) {
-    gchar *file = g_build_filename(g_get_user_config_dir(), "de", "wallpaper", NULL);
-    gchar *contents = NULL;
+    gchar *path = read_wallpaper_path();
+    gboolean first;
 
     (void)data;
-    if (g_file_get_contents(file, &contents, NULL, NULL)) {
-        g_strstrip(contents);
-        if (contents[0] != '\0' && g_strcmp0(contents, loaded_path) != 0 &&
-            g_file_test(contents, G_FILE_TEST_IS_REGULAR)) {
-            gboolean first = loaded_path == NULL;
-
-            g_free(loaded_path);
-            loaded_path = g_strdup(contents);
-            if (first) {
-                gtk_picture_set_filename(GTK_PICTURE(picture), loaded_path);
-            } else {
-                gtk_widget_add_css_class(picture, "dim");
-                g_timeout_add_once(WALLPAPER_FADE_MS, swap_wallpaper, NULL);
-            }
-        }
-        g_free(contents);
+    if (path == NULL || g_strcmp0(path, loaded_path) == 0) {
+        g_free(path);
+        return G_SOURCE_CONTINUE;
     }
-    g_free(file);
+    first = loaded_path == NULL;
+    g_free(loaded_path);
+    loaded_path = path;
+    if (first) {
+        gtk_picture_set_filename(GTK_PICTURE(picture), loaded_path);
+        return G_SOURCE_CONTINUE;
+    }
+    gtk_widget_add_css_class(picture, "dim");
+    g_clear_handle_id(&swap_source, g_source_remove);
+    swap_source = g_timeout_add(WALLPAPER_FADE_MS, swap_wallpaper, NULL);
     return G_SOURCE_CONTINUE;
 }
 
 static void open_entry(GtkButton *button, gpointer data) {
-    GError *error = NULL;
+    g_autoptr(GError) error = NULL;
 
     (void)button;
     if (!g_app_info_launch_default_for_uri((const char *)data, NULL, &error)) {
         g_warning("cannot open %s: %s", (const char *)data,
                   error != NULL ? (*error).message : "unknown error");
-        g_clear_error(&error);
     }
 }
 
@@ -112,13 +127,14 @@ static void reveal_entry(gpointer data) {
 
 static GtkWidget *build_entry(const gchar *directory, const gchar *name,
                               gboolean fresh, guint order) {
-    GFile *file = g_file_new_build_filename(directory, name, NULL);
-    GFileInfo *info = g_file_query_info(file,
-                                        G_FILE_ATTRIBUTE_STANDARD_ICON ","
-                                        G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME,
-                                        G_FILE_QUERY_INFO_NONE, NULL, NULL);
+    g_autoptr(GFile) file = g_file_new_build_filename(directory, name, NULL);
+    g_autoptr(GFileInfo) info = g_file_query_info(file,
+                                                  G_FILE_ATTRIBUTE_STANDARD_ICON ","
+                                                  G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME,
+                                                  G_FILE_QUERY_INFO_NONE, NULL, NULL);
     GtkWidget *button = gtk_button_new();
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, BOX_SPACING);
+    GtkWidget *image = NULL;
     GtkWidget *label;
     const gchar *text = name;
 
@@ -127,8 +143,7 @@ static GtkWidget *build_entry(const gchar *directory, const gchar *name,
         const gchar *display = g_file_info_get_display_name(info);
 
         if (icon != NULL) {
-            GtkWidget *image = gtk_image_new_from_gicon(icon);
-
+            image = gtk_image_new_from_gicon(icon);
             gtk_image_set_pixel_size(GTK_IMAGE(image), icon_size);
             gtk_box_append(GTK_BOX(box), image);
         }
@@ -143,6 +158,8 @@ static GtkWidget *build_entry(const gchar *directory, const gchar *name,
     gtk_box_append(GTK_BOX(box), label);
     gtk_button_set_child(GTK_BUTTON(button), box);
     gtk_widget_add_css_class(button, "entry");
+    g_object_set_data(G_OBJECT(button), "icon", image);
+    g_object_set_data(G_OBJECT(button), "label", label);
     g_signal_connect_data(button, "clicked", G_CALLBACK(open_entry), g_file_get_uri(file),
                           free_uri, 0);
 
@@ -152,11 +169,6 @@ static GtkWidget *build_entry(const gchar *directory, const gchar *name,
         gtk_widget_add_css_class(button, "fresh");
         g_timeout_add_once(delay, reveal_entry, g_object_ref(button));
     }
-
-    if (info != NULL) {
-        g_object_unref(info);
-    }
-    g_object_unref(file);
     return button;
 }
 
@@ -166,39 +178,45 @@ static void apply_icon_size(void) {
     for (child = gtk_widget_get_first_child(flow); child != NULL;
          child = gtk_widget_get_next_sibling(child)) {
         GtkWidget *button = gtk_flow_box_child_get_child(GTK_FLOW_BOX_CHILD(child));
-        GtkWidget *box = gtk_button_get_child(GTK_BUTTON(button));
-        GtkWidget *first = gtk_widget_get_first_child(box);
-        GtkWidget *last = gtk_widget_get_last_child(box);
+        GtkWidget *image = g_object_get_data(G_OBJECT(button), "icon");
+        GtkWidget *label = g_object_get_data(G_OBJECT(button), "label");
 
-        if (GTK_IS_IMAGE(first)) {
-            gtk_image_set_pixel_size(GTK_IMAGE(first), icon_size);
+        if (image != NULL) {
+            gtk_image_set_pixel_size(GTK_IMAGE(image), icon_size);
         }
-        gtk_label_set_max_width_chars(GTK_LABEL(last), label_chars());
+        gtk_label_set_max_width_chars(GTK_LABEL(label), label_chars());
     }
 }
 
-static void fill_icons(void) {
-    const gchar *directory = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
-    GHashTable *current = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+static GList *read_names(const gchar *directory) {
     GList *names = NULL;
-    GList *item;
-    GDir *dir = NULL;
+    GDir *dir;
     const gchar *name;
+
+    if (directory == NULL) {
+        return NULL;
+    }
+    dir = g_dir_open(directory, 0, NULL);
+    if (dir == NULL) {
+        return NULL;
+    }
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        if (name[0] != '.') {
+            names = g_list_prepend(names, g_strdup(name));
+        }
+    }
+    g_dir_close(dir);
+    return g_list_sort(names, compare_names);
+}
+
+static void fill_icons(void) {
+    const gchar *directory = desktop_directory();
+    GHashTable *current = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    GList *names = read_names(directory);
+    GList *item;
     guint order = 0;
 
     gtk_flow_box_remove_all(GTK_FLOW_BOX(flow));
-    if (directory != NULL) {
-        dir = g_dir_open(directory, 0, NULL);
-    }
-    if (dir != NULL) {
-        while ((name = g_dir_read_name(dir)) != NULL) {
-            if (name[0] != '.') {
-                names = g_list_prepend(names, g_strdup(name));
-            }
-        }
-        g_dir_close(dir);
-    }
-    names = g_list_sort(names, compare_names);
     for (item = names; item != NULL; item = (*item).next) {
         const gchar *entry = (const gchar *)(*item).data;
         gboolean fresh = !g_hash_table_contains(known, entry);
@@ -247,15 +265,14 @@ static void on_directory_changed(GFileMonitor *source, GFile *file, GFile *other
 }
 
 static void watch_directory(void) {
-    const gchar *directory = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
-    GFile *file;
+    const gchar *directory = desktop_directory();
+    g_autoptr(GFile) file = NULL;
 
     if (directory == NULL) {
         return;
     }
     file = g_file_new_for_path(directory);
     monitor = g_file_monitor_directory(file, G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);
-    g_object_unref(file);
     if (monitor != NULL) {
         g_signal_connect(monitor, "changed", G_CALLBACK(on_directory_changed), NULL);
     }
@@ -368,6 +385,8 @@ int main(int argc, char **argv) {
 
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_clear_handle_id(&refill_source, g_source_remove);
+    g_clear_handle_id(&swap_source, g_source_remove);
     g_clear_object(&monitor);
     g_clear_pointer(&known, g_hash_table_unref);
     g_free(loaded_path);
