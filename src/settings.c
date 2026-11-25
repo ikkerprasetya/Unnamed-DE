@@ -3,16 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
-#define OUTPUT_SIZE 2048
-#define READ_LIMIT 2000
 #define APPLY_DELAY 120
 #define REFRESH_DELAY 2
 #define BATTERY_SECONDS 5
+#define BRIGHTNESS_MIN 5
 #define POWER_DIRECTORY "/sys/class/power_supply"
-#define DASH 45
+#define DASH 45         // ASCII code, nmcli marks hidden networks with two of them
 
 static GtkWidget *window;
 static GtkWidget *network_list;
@@ -27,32 +24,37 @@ static guint volume_timer;
 static guint brightness_timer;
 static int volume_value;
 static int brightness_value;
+static gboolean refreshing;
+static gboolean refresh_again;
 
+static void refresh_network(void);
+
+// Starts a program without waiting for it. GLib reaps the child.
 static void run(char *const arguments[]) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (fork() == 0) {
-            setsid();
-            execvp(arguments[0], arguments);
-        }
-        _exit(0);
-    }
-    if (pid > 0) {
-        waitpid(pid, NULL, 0);
+    GError *error = NULL;
+
+    if (!g_spawn_async(NULL, (gchar **)arguments, NULL,
+                       G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
+                       G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, NULL, &error)) {
+        gtk_label_set_text(GTK_LABEL(status_label), (*error).message);
+        g_error_free(error);
     }
 }
 
-static void read_output(const char *command, char *buffer) {
-    FILE *pipe = popen(command, "r");
-    size_t count;
+// Runs a command and returns its output. Never returns NULL.
+static gchar *read_output(const char *command) {
+    gchar *output = NULL;
+    gchar *errors = NULL;
 
-    buffer[0] = '\0';
-    if (pipe == NULL) {
-        return;
+    if (!g_spawn_command_line_sync(command, &output, &errors, NULL, NULL)) {
+        g_free(output);
+        output = NULL;
     }
-    count = fread(buffer, 1, READ_LIMIT, pipe);
-    buffer[count] = '\0';
-    pclose(pipe);
+    g_free(errors);
+    if (output == NULL) {
+        output = g_strdup("");
+    }
+    return output;
 }
 
 static gchar *read_text(const gchar *directory, const gchar *name) {
@@ -82,6 +84,7 @@ static gboolean start_command(const gchar *const arguments[], GAsyncReadyCallbac
     return TRUE;
 }
 
+// Finishes a subprocess. Returns the output on success, otherwise the errors.
 static gchar *collect(GObject *source, GAsyncResult *result, gboolean *success) {
     gchar *output = NULL;
     gchar *errors = NULL;
@@ -109,29 +112,29 @@ static gchar *collect(GObject *source, GAsyncResult *result, gboolean *success) 
 }
 
 static int get_volume(void) {
-    char output[OUTPUT_SIZE];
-    char *start;
+    gchar *output = read_output("amixer sget Master");
+    char *start = strchr(output, '[');
+    int value = 50;
 
-    read_output("amixer sget Master", output);
-    start = strchr(output, '[');
-    if (start == NULL) {
-        return 50;
+    if (start != NULL) {
+        value = atoi(start + 1);
     }
-    return atoi(start + 1);
+    g_free(output);
+    return value;
 }
 
 static int get_brightness(void) {
-    char current[OUTPUT_SIZE];
-    char maximum[OUTPUT_SIZE];
-    int top;
+    gchar *current = read_output("brightnessctl get");
+    gchar *maximum = read_output("brightnessctl max");
+    int top = atoi(maximum);
+    int value = 50;
 
-    read_output("brightnessctl get", current);
-    read_output("brightnessctl max", maximum);
-    top = atoi(maximum);
-    if (top <= 0) {
-        return 50;
+    if (top > 0) {
+        value = atoi(current) * 100 / top;
     }
-    return atoi(current) * 100 / top;
+    g_free(current);
+    g_free(maximum);
+    return value;
 }
 
 static void show_mute(const char *output) {
@@ -146,6 +149,7 @@ static gboolean apply_volume(gpointer data) {
     char text[16];
     char *arguments[5];
 
+    (void)data;
     volume_timer = 0;
     snprintf(text, sizeof(text), "%d%%", volume_value);
     arguments[0] = "amixer";
@@ -158,6 +162,7 @@ static gboolean apply_volume(gpointer data) {
 }
 
 static void on_volume_changed(GtkRange *range, gpointer data) {
+    (void)data;
     volume_value = (int)gtk_range_get_value(range);
     if (volume_timer != 0) {
         g_source_remove(volume_timer);
@@ -166,16 +171,19 @@ static void on_volume_changed(GtkRange *range, gpointer data) {
 }
 
 static void on_mute(GtkButton *button, gpointer data) {
-    char output[OUTPUT_SIZE];
+    gchar *output = read_output("amixer sset Master toggle");
 
-    read_output("amixer sset Master toggle", output);
+    (void)button;
+    (void)data;
     show_mute(output);
+    g_free(output);
 }
 
 static gboolean apply_brightness(gpointer data) {
     char text[16];
     char *arguments[4];
 
+    (void)data;
     brightness_timer = 0;
     snprintf(text, sizeof(text), "%d%%", brightness_value);
     arguments[0] = "brightnessctl";
@@ -187,20 +195,15 @@ static gboolean apply_brightness(gpointer data) {
 }
 
 static void on_brightness_changed(GtkRange *range, gpointer data) {
+    (void)data;
     brightness_value = (int)gtk_range_get_value(range);
-    if (brightness_value < 5) {
-        brightness_value = 5;
-    }
     if (brightness_timer != 0) {
         g_source_remove(brightness_timer);
     }
     brightness_timer = g_timeout_add(APPLY_DELAY, apply_brightness, NULL);
 }
 
-static int subtract(int a, int b) {
-    return a + (~b + 1);
-}
-
+// Finds where a header name starts, or G_MAXINT when it is missing.
 static int find_column(const gchar *header, const gchar *name) {
     size_t length = strlen(name);
     char previous = ' ';
@@ -215,8 +218,10 @@ static int find_column(const gchar *header, const gchar *name) {
     return G_MAXINT;
 }
 
+// Cuts a column by character position so non ASCII names stay aligned.
 static gchar *column(const gchar *line, int start, int end) {
-    int length = (int)strlen(line);
+    int length = (int)g_utf8_strlen(line, (gssize)strlen(line));
+    gchar *part;
     gchar *text;
 
     if (start >= length) {
@@ -228,8 +233,10 @@ static gchar *column(const gchar *line, int start, int end) {
     if (end <= start) {
         return g_strdup("");
     }
-    text = g_strndup(line + start, (gsize)subtract(end, start));
-    return g_strstrip(text);
+    part = g_utf8_substring(line, start, end);
+    text = g_strdup(g_strstrip(part));
+    g_free(part);
+    return text;
 }
 
 static void add_row(const gchar *text, const gchar *ssid) {
@@ -255,6 +262,8 @@ static void on_refresh_done(GObject *source, GAsyncResult *result, gpointer data
     int count = 0;
     int i;
 
+    (void)data;
+    refreshing = FALSE;
     while ((child = gtk_widget_get_first_child(network_list)) != NULL) {
         gtk_list_box_remove(GTK_LIST_BOX(network_list), child);
     }
@@ -291,12 +300,32 @@ static void on_refresh_done(GObject *source, GAsyncResult *result, gpointer data
     }
     g_strfreev(lines);
     g_free(text);
+    if (refresh_again) {
+        refresh_again = FALSE;
+        refresh_network();
+    }
+}
+
+// Only one scan runs at a time. A request made meanwhile runs right after.
+static void refresh_network(void) {
+    const gchar *arguments[5] = {"nmcli", "device", "wifi", "list", NULL};
+
+    if (refreshing) {
+        refresh_again = TRUE;
+        return;
+    }
+    refreshing = TRUE;
+    if (!start_command(arguments, on_refresh_done)) {
+        refreshing = FALSE;
+    }
 }
 
 static void on_row_activated(GtkListBox *list, GtkListBoxRow *row, gpointer data) {
     GtkWidget *child = gtk_list_box_row_get_child(row);
     const gchar *ssid = g_object_get_data(G_OBJECT(child), "ssid");
 
+    (void)list;
+    (void)data;
     if (ssid == NULL) {
         return;
     }
@@ -306,6 +335,10 @@ static void on_row_activated(GtkListBox *list, GtkListBoxRow *row, gpointer data
 
 static gboolean on_key(GtkEventControllerKey *controller, guint keyval, guint keycode,
                        GdkModifierType state, gpointer data) {
+    (void)controller;
+    (void)keycode;
+    (void)state;
+    (void)data;
     if (keyval == GDK_KEY_Escape) {
         gtk_window_destroy(GTK_WINDOW(window));
         return GDK_EVENT_STOP;
@@ -313,16 +346,14 @@ static gboolean on_key(GtkEventControllerKey *controller, guint keyval, guint ke
     return GDK_EVENT_PROPAGATE;
 }
 
-static void refresh_network(void) {
-    const gchar *arguments[5] = {"nmcli", "device", "wifi", "list", NULL};
-    start_command(arguments, on_refresh_done);
-}
-
 static void on_refresh_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    (void)data;
     refresh_network();
 }
 
 static gboolean delayed_refresh(gpointer data) {
+    (void)data;
     refresh_network();
     return G_SOURCE_REMOVE;
 }
@@ -330,6 +361,7 @@ static gboolean delayed_refresh(gpointer data) {
 static void on_wifi(GtkButton *button, gpointer data) {
     char *arguments[5];
 
+    (void)button;
     arguments[0] = "nmcli";
     arguments[1] = "radio";
     arguments[2] = "wifi";
@@ -343,6 +375,7 @@ static void on_connect_done(GObject *source, GAsyncResult *result, gpointer data
     gboolean success;
     gchar *text = collect(source, result, &success);
 
+    (void)data;
     if (text[0] != '\0') {
         gtk_label_set_text(GTK_LABEL(status_label), text);
     } else if (success) {
@@ -360,6 +393,8 @@ static void on_connect(GtkButton *button, gpointer data) {
     const gchar *password = gtk_editable_get_text(GTK_EDITABLE(password_entry));
     const gchar *arguments[8];
 
+    (void)button;
+    (void)data;
     if (ssid[0] == '\0') {
         gtk_label_set_text(GTK_LABEL(status_label), "Enter a network name");
         return;
@@ -383,8 +418,16 @@ static void on_connect(GtkButton *button, gpointer data) {
     }
 }
 
-static void on_enter(GtkWidget *widget, gpointer data) {
+static void on_password_enter(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
     on_connect(NULL, NULL);
+}
+
+static void on_ssid_enter(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    gtk_widget_grab_focus(password_entry);
 }
 
 static void on_wallpaper_chosen(GObject *source, GAsyncResult *result, gpointer data) {
@@ -394,6 +437,7 @@ static void on_wallpaper_chosen(GObject *source, GAsyncResult *result, gpointer 
     gchar *directory;
     gchar *config;
 
+    (void)data;
     g_clear_error(&error);
     if (file == NULL) {
         return;
@@ -404,6 +448,8 @@ static void on_wallpaper_chosen(GObject *source, GAsyncResult *result, gpointer 
     g_mkdir_with_parents(directory, 0755);
     if (path != NULL && g_file_set_contents(config, path, (gssize)strlen(path), NULL)) {
         gtk_label_set_text(GTK_LABEL(status_label), "Wallpaper updated");
+    } else {
+        gtk_label_set_text(GTK_LABEL(status_label), "Could not save wallpaper");
     }
     g_free(path);
     g_free(directory);
@@ -416,10 +462,13 @@ static void on_wallpaper_clicked(GtkButton *button, gpointer data) {
     GtkFileFilter *filter = gtk_file_filter_new();
     GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
 
+    (void)button;
+    (void)data;
     gtk_file_filter_set_name(filter, "Images");
     gtk_file_filter_add_pixbuf_formats(filter);
     g_list_store_append(filters, filter);
     gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
+    gtk_file_dialog_set_default_filter(dialog, filter);
     gtk_file_dialog_open(dialog, GTK_WINDOW(window), NULL, on_wallpaper_chosen, NULL);
     g_object_unref(filter);
     g_object_unref(filters);
@@ -455,6 +504,7 @@ static gboolean update_battery(gpointer data) {
     gchar *state;
     gchar *text;
 
+    (void)data;
     if (battery_path == NULL) {
         gtk_label_set_text(GTK_LABEL(battery_label), "No battery");
         return G_SOURCE_CONTINUE;
@@ -465,6 +515,7 @@ static gboolean update_battery(gpointer data) {
         text = g_strdup("No battery");
     } else {
         text = g_strdup_printf("Battery %s%% %s", capacity, state != NULL ? state : "");
+        g_strstrip(text);
     }
     gtk_label_set_text(GTK_LABEL(battery_label), text);
     g_free(text);
@@ -473,8 +524,9 @@ static gboolean update_battery(gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
-static GtkWidget *make_scale(int value, GCallback callback) {
-    GtkWidget *scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+static GtkWidget *make_scale(int low, int value, GCallback callback) {
+    GtkWidget *scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, low, 100, 1);
+
     gtk_widget_set_hexpand(scale, TRUE);
     gtk_range_set_value(GTK_RANGE(scale), value);
     g_signal_connect(scale, "value_changed", callback, NULL);
@@ -483,6 +535,7 @@ static GtkWidget *make_scale(int value, GCallback callback) {
 
 static GtkWidget *make_title(const char *text) {
     GtkWidget *label = gtk_label_new(text);
+
     gtk_label_set_xalign(GTK_LABEL(label), 0);
     return label;
 }
@@ -506,8 +559,9 @@ static void activate(GtkApplication *app, gpointer data) {
     GtkWidget *brightness_label = gtk_label_new("Brightness");
     GtkSizeGroup *group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
     GtkEventController *keys = gtk_event_controller_key_new();
-    char output[OUTPUT_SIZE];
+    gchar *output;
 
+    (void)data;
     window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Settings");
     gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
@@ -540,12 +594,16 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_label_set_xalign(GTK_LABEL(brightness_label), 0);
     gtk_size_group_add_widget(group, volume_label);
     gtk_size_group_add_widget(group, brightness_label);
+    g_object_unref(group);
+
     gtk_box_append(GTK_BOX(volume_row), volume_label);
-    gtk_box_append(GTK_BOX(volume_row), make_scale(get_volume(), G_CALLBACK(on_volume_changed)));
+    gtk_box_append(GTK_BOX(volume_row),
+                   make_scale(0, get_volume(), G_CALLBACK(on_volume_changed)));
     gtk_box_append(GTK_BOX(volume_row), mute_button);
     gtk_box_append(GTK_BOX(brightness_row), brightness_label);
     gtk_box_append(GTK_BOX(brightness_row),
-                   make_scale(get_brightness(), G_CALLBACK(on_brightness_changed)));
+                   make_scale(BRIGHTNESS_MIN, get_brightness(),
+                              G_CALLBACK(on_brightness_changed)));
     gtk_box_append(GTK_BOX(wifi_row), wifi_on);
     gtk_box_append(GTK_BOX(wifi_row), wifi_off);
     gtk_box_append(GTK_BOX(wifi_row), refresh_button);
@@ -558,12 +616,12 @@ static void activate(GtkApplication *app, gpointer data) {
     g_signal_connect(wifi_off, "clicked", G_CALLBACK(on_wifi), "off");
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_clicked), NULL);
     g_signal_connect(connect_button, "clicked", G_CALLBACK(on_connect), NULL);
-    g_signal_connect(password_entry, "activate", G_CALLBACK(on_enter), NULL);
+    g_signal_connect(ssid_entry, "activate", G_CALLBACK(on_ssid_enter), NULL);
+    g_signal_connect(password_entry, "activate", G_CALLBACK(on_password_enter), NULL);
     g_signal_connect(network_list, "row_activated", G_CALLBACK(on_row_activated), NULL);
+    g_signal_connect(wallpaper_button, "clicked", G_CALLBACK(on_wallpaper_clicked), NULL);
     g_signal_connect(keys, "key_pressed", G_CALLBACK(on_key), NULL);
     gtk_widget_add_controller(window, keys);
-    g_object_unref(group);
-    g_signal_connect(wallpaper_button, "clicked", G_CALLBACK(on_wallpaper_clicked), NULL);
 
     gtk_box_append(GTK_BOX(box), make_title("Sound"));
     gtk_box_append(GTK_BOX(box), volume_row);
@@ -580,8 +638,9 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_box_append(GTK_BOX(box), wallpaper_button);
     gtk_window_set_child(GTK_WINDOW(window), box);
 
-    read_output("amixer sget Master", output);
+    output = read_output("amixer sget Master");
     show_mute(output);
+    g_free(output);
     battery_path = find_battery();
     update_battery(NULL);
     g_timeout_add_seconds(BATTERY_SECONDS, update_battery, NULL);
@@ -596,5 +655,6 @@ int main(int argc, char **argv) {
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
+    g_free(battery_path);
     return status;
 }

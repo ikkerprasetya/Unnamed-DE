@@ -38,13 +38,17 @@ static GtkWidget *popover;
 static GtkWidget *taskbar;
 static GtkWidget *workspace_buttons[WORKSPACES];
 static gchar *last_signature;
-static int last_current = -1;
+static int last_current = G_MAXINT;
+
+static int subtract(int a, int b) {
+    return a + (~b + 1);
+}
 
 // X11 helpers
 
 // Windows can vanish between listing and querying, so BadWindow is harmless.
 static int handle_error(Display *display, XErrorEvent *event) {
-    if (event->error_code == BadWindow) {
+    if ((*event).error_code == BadWindow) {
         return 0;
     }
     return previous_handler != NULL ? previous_handler(display, event) : 0;
@@ -111,8 +115,8 @@ static void copy_title(char *buffer, int size, const char *text) {
     const gchar *end = NULL;
 
     snprintf(buffer, size, "%s", text);
-    if (!g_utf8_validate(buffer, -1, &end)) {
-        buffer[end - buffer] = '\0';
+    if (!g_utf8_validate(buffer, (gssize)strlen(buffer), &end)) {
+        *(gchar *)end = '\0';
     }
 }
 
@@ -175,7 +179,7 @@ static void spawn(const char *path) {
     argv[1] = NULL;
     if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, child_setup,
                        NULL, NULL, &error)) {
-        g_warning("failed to launch %s: %s", path, error->message);
+        g_warning("failed to launch %s: %s", path, (*error).message);
         g_error_free(error);
     }
 }
@@ -228,7 +232,7 @@ static void launch_app(GtkButton *button, gpointer data) {
 
     gtk_popover_popdown(GTK_POPOVER(popover));
     if (!g_app_info_launch(G_APP_INFO(data), NULL, G_APP_LAUNCH_CONTEXT(context), &error)) {
-        g_warning("launch failed: %s", error->message);
+        g_warning("launch failed: %s", (*error).message);
         g_error_free(error);
     }
     g_object_unref(context);
@@ -299,20 +303,18 @@ static gboolean poll_windows(gpointer data) {
 
     (void)data;
     for (i = 0; i < count && n < MAX_TASKS; i++) {
-        Task *task = &tasks[n];
-
         if (!wants_taskbar_entry(list[i])) {
             continue;
         }
-        task->window = list[i];
-        task->active = (list[i] == active_window);
-        task->hidden = has_atom(list[i], atom_net_state, atom_state_hidden);
-        get_title(list[i], task->title, sizeof(task->title));
-        g_string_append_printf(signature, "%lu:%d:%d:%s;", (unsigned long)task->window,
-                               task->active, task->hidden, task->title);
+        tasks[n].window = list[i];
+        tasks[n].active = (list[i] == active_window);
+        tasks[n].hidden = has_atom(list[i], atom_net_state, atom_state_hidden);
+        get_title(list[i], tasks[n].title, sizeof(tasks[n].title));
+        g_string_append_printf(signature, "%lu:%d:%d:%s;", (unsigned long)tasks[n].window,
+                               tasks[n].active, tasks[n].hidden, tasks[n].title);
         n++;
     }
-    if (g_strcmp0(signature->str, last_signature) != 0) {
+    if (g_strcmp0((*signature).str, last_signature) != 0) {
         g_free(last_signature);
         last_signature = g_string_free(signature, FALSE);
         rebuild_taskbar(tasks, n);
@@ -378,8 +380,8 @@ static GtkWidget *build_popover(void) {
     GList *apps = g_list_sort(g_app_info_get_all(), compare_apps);
     GList *node;
 
-    for (node = apps; node != NULL; node = node->next) {
-        GAppInfo *info = node->data;
+    for (node = apps; node != NULL; node = g_list_next(node)) {
+        GAppInfo *info = (*node).data;
         GtkWidget *button;
 
         if (!g_app_info_should_show(info)) {
@@ -432,15 +434,15 @@ static void on_realize(GtkWidget *widget, gpointer data) {
     if (PANEL_BOTTOM) {
         strut[3] = PANEL_HEIGHT;
         strut[10] = 0;
-        strut[11] = width - 1;
+        strut[11] = subtract(width, 1);
     } else {
         strut[2] = PANEL_HEIGHT;
         strut[8] = 0;
-        strut[9] = width - 1;
+        strut[9] = subtract(width, 1);
     }
     XChangeProperty(xdisplay, xid, atom_strut_partial, XA_CARDINAL, 32, PropModeReplace,
                     (unsigned char *)strut, 12);
-    XMoveResizeWindow(xdisplay, xid, 0, PANEL_BOTTOM ? height - PANEL_HEIGHT : 0,
+    XMoveResizeWindow(xdisplay, xid, 0, PANEL_BOTTOM ? subtract(height, PANEL_HEIGHT) : 0,
                       width, PANEL_HEIGHT);
     XFlush(xdisplay);
 }
