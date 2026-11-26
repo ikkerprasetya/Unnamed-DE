@@ -203,6 +203,18 @@ static void on_brightness_changed(GtkRange *range, gpointer data) {
     brightness_timer = g_timeout_add(APPLY_DELAY, apply_brightness, NULL);
 }
 
+// Applies a slider change that is still waiting for its delay.
+static void flush_timers(void) {
+    if (volume_timer != 0) {
+        g_source_remove(volume_timer);
+        apply_volume(NULL);
+    }
+    if (brightness_timer != 0) {
+        g_source_remove(brightness_timer);
+        apply_brightness(NULL);
+    }
+}
+
 // Finds where a header name starts, or G_MAXINT when it is missing.
 static int find_column(const gchar *header, const gchar *name) {
     size_t length = strlen(name);
@@ -333,6 +345,13 @@ static void on_row_activated(GtkListBox *list, GtkListBoxRow *row, gpointer data
     gtk_widget_grab_focus(password_entry);
 }
 
+static gboolean on_close(GtkWindow *self, gpointer data) {
+    (void)self;
+    (void)data;
+    flush_timers();
+    return GDK_EVENT_PROPAGATE;
+}
+
 static gboolean on_key(GtkEventControllerKey *controller, guint keyval, guint keycode,
                        GdkModifierType state, gpointer data) {
     (void)controller;
@@ -340,7 +359,7 @@ static gboolean on_key(GtkEventControllerKey *controller, guint keyval, guint ke
     (void)state;
     (void)data;
     if (keyval == GDK_KEY_Escape) {
-        gtk_window_destroy(GTK_WINDOW(window));
+        gtk_window_close(GTK_WINDOW(window));
         return GDK_EVENT_STOP;
     }
     return GDK_EVENT_PROPAGATE;
@@ -382,6 +401,9 @@ static void on_connect_done(GObject *source, GAsyncResult *result, gpointer data
         gtk_label_set_text(GTK_LABEL(status_label), "Connected");
     } else {
         gtk_label_set_text(GTK_LABEL(status_label), "Connection failed");
+    }
+    if (success) {
+        gtk_editable_set_text(GTK_EDITABLE(password_entry), "");
     }
     g_free(text);
     gtk_widget_set_sensitive(connect_button, TRUE);
@@ -475,12 +497,14 @@ static void on_wallpaper_clicked(GtkButton *button, gpointer data) {
     g_object_unref(dialog);
 }
 
+// Skips batteries of peripherals such as mice, their scope is Device.
 static gchar *find_battery(void) {
     GDir *dir = g_dir_open(POWER_DIRECTORY, 0, NULL);
     const gchar *name;
     gchar *found = NULL;
     gchar *path;
     gchar *type;
+    gchar *scope;
 
     if (dir == NULL) {
         return NULL;
@@ -488,12 +512,14 @@ static gchar *find_battery(void) {
     while (found == NULL && (name = g_dir_read_name(dir)) != NULL) {
         path = g_build_filename(POWER_DIRECTORY, name, NULL);
         type = read_text(path, "type");
-        if (g_strcmp0(type, "Battery") == 0) {
+        scope = read_text(path, "scope");
+        if (g_strcmp0(type, "Battery") == 0 && g_strcmp0(scope, "Device") != 0) {
             found = path;
         } else {
             g_free(path);
         }
         g_free(type);
+        g_free(scope);
     }
     g_dir_close(dir);
     return found;
@@ -611,6 +637,7 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_box_append(GTK_BOX(connect_row), password_entry);
     gtk_box_append(GTK_BOX(connect_row), connect_button);
 
+    g_signal_connect(window, "close_request", G_CALLBACK(on_close), NULL);
     g_signal_connect(mute_button, "clicked", G_CALLBACK(on_mute), NULL);
     g_signal_connect(wifi_on, "clicked", G_CALLBACK(on_wifi), "on");
     g_signal_connect(wifi_off, "clicked", G_CALLBACK(on_wifi), "off");
