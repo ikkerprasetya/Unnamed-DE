@@ -145,19 +145,16 @@ static void show_mute(const char *output) {
     }
 }
 
+// Setting a level can unmute the mixer, so the button follows the reply.
 static gboolean apply_volume(gpointer data) {
-    char text[16];
-    char *arguments[5];
+    gchar *command = g_strdup_printf("amixer sset Master %d%%", volume_value);
+    gchar *output = read_output(command);
 
     (void)data;
     volume_timer = 0;
-    snprintf(text, sizeof(text), "%d%%", volume_value);
-    arguments[0] = "amixer";
-    arguments[1] = "sset";
-    arguments[2] = "Master";
-    arguments[3] = text;
-    arguments[4] = NULL;
-    run(arguments);
+    show_mute(output);
+    g_free(output);
+    g_free(command);
     return G_SOURCE_REMOVE;
 }
 
@@ -377,17 +374,32 @@ static gboolean delayed_refresh(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+static void on_wifi_done(GObject *source, GAsyncResult *result, gpointer data) {
+    gboolean success;
+    gchar *text = collect(source, result, &success);
+
+    (void)data;
+    if (success) {
+        gtk_label_set_text(GTK_LABEL(status_label), "");
+    } else if (text[0] != '\0') {
+        gtk_label_set_text(GTK_LABEL(status_label), text);
+    } else {
+        gtk_label_set_text(GTK_LABEL(status_label), "Wifi command failed");
+    }
+    g_free(text);
+    g_timeout_add_seconds(REFRESH_DELAY, delayed_refresh, NULL);
+}
+
 static void on_wifi(GtkButton *button, gpointer data) {
-    char *arguments[5];
+    const gchar *arguments[5];
 
     (void)button;
     arguments[0] = "nmcli";
     arguments[1] = "radio";
     arguments[2] = "wifi";
-    arguments[3] = (char *)data;
+    arguments[3] = (const gchar *)data;
     arguments[4] = NULL;
-    run(arguments);
-    g_timeout_add_seconds(REFRESH_DELAY, delayed_refresh, NULL);
+    start_command(arguments, on_wifi_done);
 }
 
 static void on_connect_done(GObject *source, GAsyncResult *result, gpointer data) {
