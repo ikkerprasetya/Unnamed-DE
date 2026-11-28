@@ -8,6 +8,12 @@
 #define REFRESH_DELAY 2
 #define BATTERY_SECONDS 5
 #define BRIGHTNESS_MIN 5
+#define DEFAULT_LEVEL 50
+#define WINDOW_WIDTH 520
+#define WINDOW_HEIGHT 520
+#define LIST_HEIGHT 160
+#define MARGIN 12
+#define SPACING 6
 #define POWER_DIRECTORY "/sys/class/power_supply"
 #define DASH 45         // ASCII code, nmcli marks hidden networks with two of them
 
@@ -68,13 +74,16 @@ static gchar *read_text(const gchar *directory, const gchar *name) {
     return text;
 }
 
+// The C locale keeps the nmcli header names the parser looks for.
 static gboolean start_command(const gchar *const arguments[], GAsyncReadyCallback callback) {
+    GSubprocessLauncher *launcher = g_subprocess_launcher_new(
+        G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
     GError *error = NULL;
-    GSubprocess *process = g_subprocess_newv(arguments,
-                                             G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                             G_SUBPROCESS_FLAGS_STDERR_PIPE,
-                                             &error);
+    GSubprocess *process;
 
+    g_subprocess_launcher_setenv(launcher, "LC_ALL", "C", TRUE);
+    process = g_subprocess_launcher_spawnv(launcher, arguments, &error);
+    g_object_unref(launcher);
     if (process == NULL) {
         g_clear_error(&error);
         gtk_label_set_text(GTK_LABEL(status_label), "Command not found");
@@ -114,7 +123,7 @@ static gchar *collect(GObject *source, GAsyncResult *result, gboolean *success) 
 static int get_volume(void) {
     gchar *output = read_output("amixer sget Master");
     char *start = strchr(output, '[');
-    int value = 50;
+    int value = DEFAULT_LEVEL;
 
     if (start != NULL) {
         value = atoi(start + 1);
@@ -127,7 +136,7 @@ static int get_brightness(void) {
     gchar *current = read_output("brightnessctl get");
     gchar *maximum = read_output("brightnessctl max");
     int top = atoi(maximum);
-    int value = 50;
+    int value = DEFAULT_LEVEL;
 
     if (top > 0) {
         value = atoi(current) * 100 / top;
@@ -422,6 +431,7 @@ static void on_connect_done(GObject *source, GAsyncResult *result, gpointer data
     refresh_network();
 }
 
+// Enter in the password field also lands here, so a running attempt blocks it.
 static void on_connect(GtkButton *button, gpointer data) {
     const gchar *ssid = gtk_editable_get_text(GTK_EDITABLE(ssid_entry));
     const gchar *password = gtk_editable_get_text(GTK_EDITABLE(password_entry));
@@ -429,6 +439,9 @@ static void on_connect(GtkButton *button, gpointer data) {
 
     (void)button;
     (void)data;
+    if (!gtk_widget_get_sensitive(connect_button)) {
+        return;
+    }
     if (ssid[0] == '\0') {
         gtk_label_set_text(GTK_LABEL(status_label), "Enter a network name");
         return;
@@ -579,11 +592,11 @@ static GtkWidget *make_title(const char *text) {
 }
 
 static GtkWidget *make_row(void) {
-    return gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    return gtk_box_new(GTK_ORIENTATION_HORIZONTAL, SPACING);
 }
 
 static void activate(GtkApplication *app, gpointer data) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, SPACING);
     GtkWidget *volume_row = make_row();
     GtkWidget *brightness_row = make_row();
     GtkWidget *wifi_row = make_row();
@@ -603,11 +616,11 @@ static void activate(GtkApplication *app, gpointer data) {
     window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Settings");
     gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
-    gtk_window_set_default_size(GTK_WINDOW(window), 520, 520);
-    gtk_widget_set_margin_top(box, 12);
-    gtk_widget_set_margin_bottom(box, 12);
-    gtk_widget_set_margin_start(box, 12);
-    gtk_widget_set_margin_end(box, 12);
+    gtk_window_set_default_size(GTK_WINDOW(window), WINDOW_WIDTH, WINDOW_HEIGHT);
+    gtk_widget_set_margin_top(box, MARGIN);
+    gtk_widget_set_margin_bottom(box, MARGIN);
+    gtk_widget_set_margin_start(box, MARGIN);
+    gtk_widget_set_margin_end(box, MARGIN);
 
     mute_button = gtk_button_new_with_label("Mute");
     connect_button = gtk_button_new_with_label("Connect");
@@ -625,7 +638,7 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_label_set_xalign(GTK_LABEL(status_label), 0);
     gtk_label_set_wrap(GTK_LABEL(status_label), TRUE);
     gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 160);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), LIST_HEIGHT);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), network_list);
 
     gtk_label_set_xalign(GTK_LABEL(volume_label), 0);
